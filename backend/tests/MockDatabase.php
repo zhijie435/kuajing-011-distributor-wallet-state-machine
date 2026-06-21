@@ -137,6 +137,7 @@ class MockDatabase
         $sql = trim($sql);
         
         if (stripos($sql, 'SELECT') === 0) {
+            $sql = preg_replace('/\s+FOR\s+UPDATE\s*$/i', '', $sql);
             return $this->executeSelect($sql, $params);
         } elseif (stripos($sql, 'INSERT') === 0) {
             return $this->executeInsert($sql, $params);

@@ -6,18 +6,18 @@ use Dealer\Wallet\Enum\FreezeStatus;
 
 class FreezeRecord
 {
-    public int $id;
-    public int $walletId;
-    public int $dealerId;
-    public string $freezeNo;
-    public float $amount;
-    public float $remainingAmount;
-    public int $status;
-    public string $reason;
-    public ?string $expiredAt;
-    public string $operator;
-    public string $createdAt;
-    public string $updatedAt;
+    public int $id = 0;
+    public int $walletId = 0;
+    public int $dealerId = 0;
+    public string $freezeNo = '';
+    public float $amount = 0.0;
+    public float $remainingAmount = 0.0;
+    public int $status = 0;
+    public string $reason = '';
+    public ?string $expiredAt = null;
+    public string $operator = '';
+    public string $createdAt = '';
+    public string $updatedAt = '';
 
     public function __construct(array $data = [])
     {

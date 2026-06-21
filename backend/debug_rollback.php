@@ -35,7 +35,22 @@ use Dealer\Wallet\Exception\WalletStateException;
 use Dealer\Wallet\Exception\WalletPermissionException;
 
 $db = MockDatabase::getInstance();
-$db->seedDefaultData();
+MockDatabase::resetInstance();
+$db = MockDatabase::getInstance();
+
+$db->createTable('dealer_wallet', [
+    'id', 'dealer_id', 'balance', 'frozen_amount', 'available_amount',
+    'status', 'version', 'created_at', 'updated_at'
+]);
+$db->createTable('dealer_wallet_freeze_record', [
+    'id', 'wallet_id', 'dealer_id', 'freeze_no', 'amount', 'remaining_amount',
+    'status', 'reason', 'expired_at', 'operator', 'created_at', 'updated_at'
+]);
+$db->createTable('dealer_wallet_transaction', [
+    'id', 'wallet_id', 'dealer_id', 'type', 'amount', 'balance_before',
+    'balance_after', 'frozen_before', 'frozen_after', 'related_no',
+    'operator', 'remark', 'created_at'
+]);
 
 echo "\033[1;36m============================================\033[0m\n";
 echo "\033[1;36m  经销商钱包状态机 - 回滚提示和重试入口测试\033[0m\n";

@@ -17,7 +17,6 @@ require_once __DIR__ . '/../src/Model/Wallet.php';
 require_once __DIR__ . '/../src/Model/FreezeRecord.php';
 require_once __DIR__ . '/../src/Model/Transaction.php';
 require_once __DIR__ . '/../src/StateMachine/WalletStateMachine.php';
-require_once __DIR__ . '/../src/Config/Database.php';
 require_once __DIR__ . '/../src/Repository/WalletRepository.php';
 require_once __DIR__ . '/../src/Repository/FreezeRecordRepository.php';
 require_once __DIR__ . '/../src/Repository/TransactionRepository.php';

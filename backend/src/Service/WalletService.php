@@ -25,7 +25,8 @@ class WalletService
     private FreezeRecordRepository $freezeRecordRepository;
     private ReconciliationService $reconciliationService;
     private PermissionService $permissionService;
-    private PDO $pdo;
+    /** @var PDO|MockDatabase */
+    private $pdo;
 
     public function __construct()
     {
@@ -409,7 +410,9 @@ class WalletService
         bool $checkAvailable = false
     ): array {
         return $this->executeTransaction(function () use ($dealerId, $amount, $txType, $isIncrease, $options, $checkAvailable) {
-            $wallet = $this->getWalletForUpdate($dealerId);
+            $wallet = $isIncrease
+                ? $this->getOrCreateWalletForUpdate($dealerId)
+                : $this->getWalletForUpdate($dealerId);
 
             if ($checkAvailable) {
                 $actionName = $txType === TransactionType::WITHDRAW ? '提现' : '消费';

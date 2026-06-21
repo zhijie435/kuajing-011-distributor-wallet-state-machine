@@ -6,19 +6,19 @@ use Dealer\Wallet\Enum\TransactionType;
 
 class Transaction
 {
-    public int $id;
-    public int $walletId;
-    public int $dealerId;
-    public int $type;
-    public float $amount;
-    public float $balanceBefore;
-    public float $balanceAfter;
-    public float $frozenBefore;
-    public float $frozenAfter;
-    public string $relatedNo;
-    public string $operator;
-    public string $remark;
-    public string $createdAt;
+    public int $id = 0;
+    public int $walletId = 0;
+    public int $dealerId = 0;
+    public int $type = 0;
+    public float $amount = 0.0;
+    public float $balanceBefore = 0.0;
+    public float $balanceAfter = 0.0;
+    public float $frozenBefore = 0.0;
+    public float $frozenAfter = 0.0;
+    public string $relatedNo = '';
+    public string $operator = '';
+    public string $remark = '';
+    public string $createdAt = '';
 
     public function __construct(array $data = [])
     {

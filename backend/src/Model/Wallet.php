@@ -7,15 +7,15 @@ use Dealer\Wallet\StateMachine\WalletStateMachine;
 
 class Wallet
 {
-    public int $id;
-    public int $dealerId;
-    public float $balance;
-    public float $frozenAmount;
-    public float $availableAmount;
-    public int $status;
-    public int $version;
-    public string $createdAt;
-    public string $updatedAt;
+    public int $id = 0;
+    public int $dealerId = 0;
+    public float $balance = 0.0;
+    public float $frozenAmount = 0.0;
+    public float $availableAmount = 0.0;
+    public int $status = 1;
+    public int $version = 0;
+    public string $createdAt = '';
+    public string $updatedAt = '';
 
     public function __construct(array $data = [], bool $fromDatabase = true)
     {
