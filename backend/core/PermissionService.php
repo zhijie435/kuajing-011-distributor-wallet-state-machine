@@ -2,11 +2,173 @@
 
 class PermissionService
 {
+    public const ROLE_SUPER_ADMIN = 'super_admin';
+    public const ROLE_WALLET_ADMIN = 'wallet_admin';
+    public const ROLE_DEALER = 'dealer';
+    public const ROLE_AUDITOR = 'auditor';
+
+    public const PERM_WALLET_VIEW_OWN = 'wallet:view:own';
+    public const PERM_WALLET_VIEW_ALL = 'wallet:view:all';
+    public const PERM_WALLET_TRANSACTIONS_OWN = 'wallet:transactions:own';
+    public const PERM_WALLET_TRANSACTIONS_ALL = 'wallet:transactions:all';
+    public const PERM_WALLET_FREEZE_RECORDS_OWN = 'wallet:freeze:own';
+    public const PERM_WALLET_FREEZE_RECORDS_ALL = 'wallet:freeze:all';
+    public const PERM_WALLET_RECONCILE = 'wallet:reconcile';
+    public const PERM_WALLET_FIX = 'wallet:fix';
+    public const PERM_WALLET_EXPORT = 'wallet:export';
+
     private $config;
+
+    private ?array $operatorContext = null;
 
     public function __construct()
     {
         $this->config = require __DIR__ . "/../config/config.php";
+    }
+
+    public function setOperatorContext(array $context): void
+    {
+        $this->operatorContext = $context + [
+            'operator_id' => null,
+            'dealer_id' => null,
+            'roles' => [],
+            'permissions' => [],
+            'scoped_dealer_ids' => null,
+        ];
+    }
+
+    public function getOperatorContext(): ?array
+    {
+        return $this->operatorContext;
+    }
+
+    public function hasRole(string $role): bool
+    {
+        if ($this->operatorContext === null) {
+            return false;
+        }
+        return in_array($role, (array)($this->operatorContext['roles'] ?? []), true);
+    }
+
+    public function hasPermission(string $permission): bool
+    {
+        if ($this->operatorContext === null) {
+            return false;
+        }
+        if ($this->hasRole(self::ROLE_SUPER_ADMIN)) {
+            return true;
+        }
+        return in_array($permission, (array)($this->operatorContext['permissions'] ?? []), true);
+    }
+
+    public function isAdmin(): bool
+    {
+        return $this->hasRole(self::ROLE_SUPER_ADMIN)
+            || $this->hasRole(self::ROLE_WALLET_ADMIN);
+    }
+
+    public function isAuditor(): bool
+    {
+        return $this->hasRole(self::ROLE_SUPER_ADMIN)
+            || $this->hasRole(self::ROLE_AUDITOR);
+    }
+
+    public function canViewWallet(int $targetDealerId): bool
+    {
+        if ($this->operatorContext === null) {
+            return false;
+        }
+        if ($this->hasPermission(self::PERM_WALLET_VIEW_ALL)) {
+            return true;
+        }
+        if ($this->hasPermission(self::PERM_WALLET_VIEW_OWN)) {
+            $ownDealerId = (int)($this->operatorContext['dealer_id'] ?? 0);
+            return $targetDealerId === $ownDealerId && $this->isInScope($targetDealerId);
+        }
+        return false;
+    }
+
+    public function canViewAllWallets(): bool
+    {
+        return $this->hasPermission(self::PERM_WALLET_VIEW_ALL);
+    }
+
+    public function canViewTransactions(int $targetDealerId): bool
+    {
+        if ($this->operatorContext === null) {
+            return false;
+        }
+        if ($this->hasPermission(self::PERM_WALLET_TRANSACTIONS_ALL)) {
+            return true;
+        }
+        if ($this->hasPermission(self::PERM_WALLET_TRANSACTIONS_OWN)) {
+            $ownDealerId = (int)($this->operatorContext['dealer_id'] ?? 0);
+            return $targetDealerId === $ownDealerId && $this->isInScope($targetDealerId);
+        }
+        return false;
+    }
+
+    public function canViewFreezeRecords(int $targetDealerId): bool
+    {
+        if ($this->operatorContext === null) {
+            return false;
+        }
+        if ($this->hasPermission(self::PERM_WALLET_FREEZE_RECORDS_ALL)) {
+            return true;
+        }
+        if ($this->hasPermission(self::PERM_WALLET_FREEZE_RECORDS_OWN)) {
+            $ownDealerId = (int)($this->operatorContext['dealer_id'] ?? 0);
+            return $targetDealerId === $ownDealerId && $this->isInScope($targetDealerId);
+        }
+        return false;
+    }
+
+    public function canReconcile(int $targetDealerId): bool
+    {
+        if ($this->hasPermission(self::PERM_WALLET_RECONCILE)) {
+            return $this->canViewWallet($targetDealerId);
+        }
+        return false;
+    }
+
+    public function canFixWallet(int $targetDealerId): bool
+    {
+        if ($this->hasPermission(self::PERM_WALLET_FIX)) {
+            return $this->canViewWallet($targetDealerId);
+        }
+        return false;
+    }
+
+    public function canExport(int $targetDealerId): bool
+    {
+        if ($this->hasPermission(self::PERM_WALLET_EXPORT)) {
+            return $this->canViewWallet($targetDealerId);
+        }
+        return false;
+    }
+
+    public function getCurrentDealerId(): ?int
+    {
+        if ($this->operatorContext === null) {
+            return null;
+        }
+        $id = $this->operatorContext['dealer_id'] ?? null;
+        return $id === null ? null : (int)$id;
+    }
+
+    private function isInScope(int $targetDealerId): bool
+    {
+        if ($this->operatorContext === null) {
+            return false;
+        }
+        $scoped = $this->operatorContext['scoped_dealer_ids'] ?? null;
+        if ($scoped === null || $scoped === '*') {
+            return true;
+        }
+        if (!is_array($scoped)) {
+            return false;
+        }
+        return in_array($targetDealerId, array_map('intval', $scoped), true);
     }
 
     public function validateCallbackToken($token)
@@ -45,7 +207,7 @@ class PermissionService
         }
 
         $whitelist = $this->config["callback"]["ip_whitelist"] ?? [];
-        
+
         foreach ($whitelist as $allowedIp) {
             if (strpos($allowedIp, "/") !== false) {
                 if ($this->ipInCidr($ip, $allowedIp)) {
@@ -74,11 +236,11 @@ class PermissionService
     private function ipInCidr($ip, $cidr)
     {
         list($subnet, $mask) = explode("/", $cidr);
-        
+
         $ipLong = ip2long($ip);
         $subnetLong = ip2long($subnet);
         $maskLong = -1 << (32 - $mask);
-        
+
         return ($ipLong & $maskLong) === ($subnetLong & $maskLong);
     }
 

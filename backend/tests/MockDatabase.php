@@ -4,14 +4,44 @@ class MockStatement
 {
     private $rows;
     private $cursor = 0;
+    private $sql;
+    private $params = [];
+    private $db;
 
-    public function __construct($rows = [])
+    public function __construct($rows = [], $sql = '', $db = null)
     {
         $this->rows = $rows;
+        $this->sql = $sql;
+        $this->db = $db;
+    }
+
+    public function bindValue($param, $value, $type = null)
+    {
+        $this->params[$param] = $value;
+        return true;
     }
 
     public function execute($params = [])
     {
+        if (!empty($params)) {
+            $this->params = array_merge($this->params, $params);
+        }
+
+        if ($this->db !== null && !empty($this->sql)) {
+            $sql = $this->sql;
+            foreach ($this->params as $key => $value) {
+                if (is_string($value)) {
+                    $value = "'" . addslashes($value) . "'";
+                }
+                $sql = str_replace($key, $value, $sql);
+            }
+            $result = $this->db->query($sql);
+            if ($result instanceof self) {
+                $this->rows = $result->rows;
+            }
+        }
+
+        $this->cursor = 0;
         return true;
     }
 
@@ -28,6 +58,16 @@ class MockStatement
     public function fetchAll($fetchStyle = PDO::FETCH_ASSOC)
     {
         return $this->rows;
+    }
+
+    public function fetchColumn($columnNumber = 0)
+    {
+        if (empty($this->rows)) {
+            return false;
+        }
+        $row = $this->rows[0];
+        $values = array_values($row);
+        return $values[$columnNumber] ?? false;
     }
 
     public function rowCount()
@@ -51,6 +91,7 @@ class MockDatabase
     private $autoIncrements = [];
     private $inTransaction = false;
     private $transactionSavepoint = null;
+    private $lastInsertId = 0;
 
     public static function getInstance()
     {
@@ -70,12 +111,25 @@ class MockDatabase
         return $this;
     }
 
+    public static function __callStatic($name, $arguments)
+    {
+        if ($name === 'getConnection') {
+            return self::getInstance();
+        }
+        return null;
+    }
+
     public function createTable($tableName, $columns)
     {
         if (!isset($this->tables[$tableName])) {
             $this->tables[$tableName] = [];
             $this->autoIncrements[$tableName] = 1;
         }
+    }
+
+    public function prepare($sql, $options = [])
+    {
+        return new MockStatement([], $sql, $this);
     }
 
     public function query($sql, $params = [])
@@ -159,7 +213,7 @@ class MockDatabase
 
     public function lastInsertId()
     {
-        return 0;
+        return $this->lastInsertId;
     }
 
     private function deepCopy($data)
@@ -694,7 +748,54 @@ class MockDatabase
 
     private function executeInsert($sql, $params)
     {
-        return new MockStatement([]);
+        $tableMatches = [];
+        if (!preg_match('/INSERT\s+INTO\s+(\w+)\s*\((.+?)\)\s*VALUES\s*\((.+?)\)/is', $sql, $tableMatches)) {
+            return new MockStatement([]);
+        }
+        $table = $tableMatches[1];
+        $columns = array_map('trim', explode(',', $tableMatches[2]));
+        $valuesRaw = $tableMatches[3];
+
+        $valueMatches = [];
+        preg_match_all("/(?:'([^']*)'|(\d+(?:\.\d+)?)|(:\w+)|\bNULL\b)/i", $valuesRaw, $valueMatches);
+        $values = [];
+        $paramIndex = 0;
+        foreach ($valueMatches[0] as $i => $match) {
+            if ($match === 'NULL' || $match === 'null') {
+                $values[] = null;
+            } elseif (strpos($match, ':') === 0) {
+                $values[] = $params[$match] ?? null;
+            } elseif ($valueMatches[1][$i] !== '') {
+                $values[] = $valueMatches[1][$i];
+            } elseif ($valueMatches[2][$i] !== '') {
+                $values[] = $valueMatches[2][$i] + 0;
+            } else {
+                $values[] = null;
+            }
+        }
+
+        $data = [];
+        foreach ($columns as $index => $col) {
+            $data[$col] = $values[$index] ?? null;
+        }
+
+        if (!isset($this->tables[$table])) {
+            $this->tables[$table] = [];
+            $this->autoIncrements[$table] = 1;
+        }
+
+        if (!isset($data['id'])) {
+            $data['id'] = $this->autoIncrements[$table]++;
+        } else {
+            if ($data['id'] >= $this->autoIncrements[$table]) {
+                $this->autoIncrements[$table] = $data['id'] + 1;
+            }
+        }
+
+        $this->tables[$table][] = $data;
+        $this->lastInsertId = $data['id'];
+
+        return new MockStatement([['id' => $data['id']]], '', $this);
     }
 
     private function executeUpdate($sql, $params)

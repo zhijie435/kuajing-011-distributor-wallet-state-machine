@@ -25,9 +25,22 @@ class Transaction
         foreach ($data as $key => $value) {
             $property = lcfirst(str_replace('_', '', ucwords($key, '_')));
             if (property_exists($this, $property)) {
-                $this->$property = $value;
+                $this->$property = $this->castProperty($property, $value);
             }
         }
+    }
+
+    private function castProperty(string $property, $value)
+    {
+        $intProps = ['id', 'walletId', 'dealerId', 'type'];
+        $floatProps = ['amount', 'balanceBefore', 'balanceAfter', 'frozenBefore', 'frozenAfter'];
+        if (in_array($property, $intProps, true)) {
+            return (int)$value;
+        }
+        if (in_array($property, $floatProps, true)) {
+            return (float)$value;
+        }
+        return (string)$value;
     }
 
     public function toArray(): array

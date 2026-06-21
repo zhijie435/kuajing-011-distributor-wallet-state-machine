@@ -4,6 +4,7 @@ namespace Dealer\Wallet\StateMachine;
 
 use Dealer\Wallet\Enum\WalletStatus;
 use Dealer\Wallet\Exception\WalletStateException;
+use Dealer\Wallet\Model\Wallet;
 
 class WalletStateMachine
 {
@@ -27,9 +28,53 @@ class WalletStateMachine
     public function __construct(int $currentStatus)
     {
         if (!isset(self::$allowedTransitions[$currentStatus])) {
-            throw new WalletStateException("数据异常：无效的钱包状态值 ({$currentStatus})，合法状态：1-正常 2-部分冻结 3-全额冻结");
+            throw new WalletStateException(
+                "数据异常：无效的钱包状态值 ({$currentStatus})，合法状态：1-正常 2-部分冻结 3-全额冻结"
+            );
         }
         $this->currentStatus = $currentStatus;
+    }
+
+    public static function fromWallet(Wallet $wallet): self
+    {
+        return new self($wallet->status);
+    }
+
+    public static function validateAmounts(float $balance, float $frozenAmount): void
+    {
+        if ($frozenAmount < -0.001) {
+            throw new WalletStateException(
+                "数据异常：冻结金额为负数 (¥" . number_format($frozenAmount, 2) . ")，" .
+                "请检查钱包数据完整性，可能存在解冻/扣除操作超额问题。"
+            );
+        }
+        if ($balance < -0.001) {
+            throw new WalletStateException(
+                "数据异常：账户余额为负数 (¥" . number_format($balance, 2) . ")，" .
+                "请检查交易流水，可能存在消费/提现操作超额问题。"
+            );
+        }
+        if ($frozenAmount > $balance + 0.001) {
+            throw new WalletStateException(
+                "数据异常：冻结金额 (¥" . number_format($frozenAmount, 2) .
+                ") 超过账户余额 (¥" . number_format($balance, 2) . ")，" .
+                "差额 ¥" . number_format($frozenAmount - $balance, 2) .
+                "，请核查冻结记录与钱包余额是否一致。"
+            );
+        }
+    }
+
+    public static function calculateStatus(float $balance, float $frozenAmount): int
+    {
+        self::validateAmounts($balance, $frozenAmount);
+
+        if ($frozenAmount <= 0.001) {
+            return WalletStatus::NORMAL;
+        }
+        if ($frozenAmount >= $balance - 0.001) {
+            return WalletStatus::FULLY_FROZEN;
+        }
+        return WalletStatus::PARTIALLY_FROZEN;
     }
 
     public function canTransitionTo(int $targetStatus): bool
@@ -93,40 +138,27 @@ class WalletStateMachine
         ];
     }
 
+    public function applyToWallet(Wallet $wallet, float $newBalance, float $newFrozen, array $transition = null): array
+    {
+        if ($transition === null) {
+            $transition = $this->assertCanTransitionByAmount($newBalance, $wallet->frozenAmount, $newFrozen);
+        }
+
+        if ($transition['changed']) {
+            $this->transition($transition['to_status']);
+        }
+
+        $wallet->balance = $newBalance;
+        $wallet->frozenAmount = $newFrozen;
+        $wallet->availableAmount = (float)bcsub((string)$newBalance, (string)$newFrozen, 2);
+        $wallet->status = $this->currentStatus;
+
+        return $transition;
+    }
+
     public function getCurrentStatus(): int
     {
         return $this->currentStatus;
-    }
-
-    public static function calculateStatus(float $balance, float $frozenAmount): int
-    {
-        if ($frozenAmount < -0.001) {
-            throw new WalletStateException(
-                "数据异常：冻结金额为负数 (¥" . number_format($frozenAmount, 2) . ")，" .
-                "请检查钱包数据完整性，可能存在解冻/扣除操作超额问题。"
-            );
-        }
-        if ($balance < -0.001) {
-            throw new WalletStateException(
-                "数据异常：账户余额为负数 (¥" . number_format($balance, 2) . ")，" .
-                "请检查交易流水，可能存在消费/提现操作超额问题。"
-            );
-        }
-        if ($frozenAmount > $balance + 0.001) {
-            throw new WalletStateException(
-                "数据异常：冻结金额 (¥" . number_format($frozenAmount, 2) .
-                ") 超过账户余额 (¥" . number_format($balance, 2) . ")，" .
-                "差额 ¥" . number_format($frozenAmount - $balance, 2) .
-                "，请核查冻结记录与钱包余额是否一致。"
-            );
-        }
-        if ($frozenAmount <= 0.001) {
-            return WalletStatus::NORMAL;
-        }
-        if ($frozenAmount >= $balance - 0.001) {
-            return WalletStatus::FULLY_FROZEN;
-        }
-        return WalletStatus::PARTIALLY_FROZEN;
     }
 
     public static function getAllowedTransitions(int $status): array

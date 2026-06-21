@@ -24,9 +24,25 @@ class FreezeRecord
         foreach ($data as $key => $value) {
             $property = lcfirst(str_replace('_', '', ucwords($key, '_')));
             if (property_exists($this, $property)) {
-                $this->$property = $value;
+                $this->$property = $this->castProperty($property, $value);
             }
         }
+    }
+
+    private function castProperty(string $property, $value)
+    {
+        $intProps = ['id', 'walletId', 'dealerId', 'status'];
+        $floatProps = ['amount', 'remainingAmount'];
+        if (in_array($property, $intProps, true)) {
+            return (int)$value;
+        }
+        if (in_array($property, $floatProps, true)) {
+            return (float)$value;
+        }
+        if ($property === 'expiredAt') {
+            return $value === null || $value === '' ? null : (string)$value;
+        }
+        return (string)$value;
     }
 
     public function toArray(): array

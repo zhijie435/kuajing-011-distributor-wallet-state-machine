@@ -2,7 +2,8 @@
 
 require_once __DIR__ . '/tests/bootstrap.php';
 
-require_once __DIR__ . '/src/Config/Database.php';
+class_alias('MockDatabase', 'Dealer\\Wallet\\Config\\Database');
+
 require_once __DIR__ . '/src/Enum/WalletStatus.php';
 require_once __DIR__ . '/src/Enum/FreezeStatus.php';
 require_once __DIR__ . '/src/Enum/TransactionType.php';
@@ -18,8 +19,6 @@ require_once __DIR__ . '/src/Repository/TransactionRepository.php';
 require_once __DIR__ . '/src/StateMachine/WalletStateMachine.php';
 require_once __DIR__ . '/src/Service/ReconciliationService.php';
 require_once __DIR__ . '/src/Service/WalletService.php';
-
-class_alias('MockDatabase', 'Dealer\\Wallet\\Config\\Database');
 
 use Dealer\Wallet\Service\WalletService;
 use Dealer\Wallet\Exception\WalletException;
