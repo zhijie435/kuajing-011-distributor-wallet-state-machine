@@ -2,6 +2,13 @@
 
 require_once __DIR__ . '/tests/bootstrap.php';
 
+require_once __DIR__ . '/core/OrderNoGenerator.php';
+require_once __DIR__ . '/core/PermissionService.php';
+require_once __DIR__ . '/core/AuditService.php';
+require_once __DIR__ . '/core/WarehouseRouter.php';
+require_once __DIR__ . '/core/OrderService.php';
+require_once __DIR__ . '/core/FulfillmentCallbackService.php';
+
 class_alias('MockDatabase', 'Dealer\\Wallet\\Config\\Database');
 
 require_once __DIR__ . '/src/Enum/WalletStatus.php';
@@ -10,6 +17,7 @@ require_once __DIR__ . '/src/Enum/TransactionType.php';
 require_once __DIR__ . '/src/Exception/WalletException.php';
 require_once __DIR__ . '/src/Exception/InsufficientBalanceException.php';
 require_once __DIR__ . '/src/Exception/WalletStateException.php';
+require_once __DIR__ . '/src/Exception/WalletPermissionException.php';
 require_once __DIR__ . '/src/Model/Wallet.php';
 require_once __DIR__ . '/src/Model/FreezeRecord.php';
 require_once __DIR__ . '/src/Model/Transaction.php';
@@ -24,6 +32,7 @@ use Dealer\Wallet\Service\WalletService;
 use Dealer\Wallet\Exception\WalletException;
 use Dealer\Wallet\Exception\InsufficientBalanceException;
 use Dealer\Wallet\Exception\WalletStateException;
+use Dealer\Wallet\Exception\WalletPermissionException;
 
 $db = MockDatabase::getInstance();
 $db->seedDefaultData();
@@ -33,6 +42,14 @@ echo "\033[1;36m  经销商钱包状态机 - 回滚提示和重试入口测试\0
 echo "\033[1;36m============================================\033[0m\n\n";
 
 $walletService = new WalletService();
+
+$walletService->getPermissionService()->setOperatorContext([
+    'operator_id' => 1,
+    'dealer_id' => null,
+    'roles' => ['super_admin'],
+    'permissions' => ['*'],
+    'scoped_dealer_ids' => '*',
+]);
 
 $dealerId = 1;
 
@@ -65,6 +82,8 @@ try {
             echo "    - {$detail}\n";
         }
         echo "\n";
+    } else {
+        echo "  \033[0;31m✗ 缺少回滚信息\033[0m\n\n";
     }
     
     if ($e->hasRetryInfo()) {
@@ -86,10 +105,15 @@ try {
             }
         }
         echo "\n";
+    } else {
+        echo "  \033[0;31m✗ 缺少重试信息\033[0m\n\n";
     }
     
     echo "  \033[1;36m=== 完整上下文（getFullContext）===\033[0m\n";
-    print_r($e->getFullContext());
+    $ctx = $e->getFullContext();
+    echo "  message: {$ctx['message']}\n";
+    echo "  rollback 存在: " . (empty($ctx['rollback']) ? '否' : '是') . "\n";
+    echo "  retry 存在: " . (empty($ctx['retry']) ? '否' : '是') . "\n";
     echo "\n";
 }
 
@@ -114,6 +138,8 @@ try {
             echo "    - {$detail}\n";
         }
         echo "\n";
+    } else {
+        echo "  \033[0;31m✗ 缺少回滚信息\033[0m\n\n";
     }
     
     if ($e->hasRetryInfo()) {
@@ -127,10 +153,58 @@ try {
             echo "    - {$suggestion}\n";
         }
         echo "\n";
+    } else {
+        echo "  \033[0;31m✗ 缺少重试信息\033[0m\n\n";
     }
 }
 
-echo "【测试 4】验证操作后钱包状态未受影响（回滚生效）\n";
+echo "【测试 4】测试权限异常时的回滚提示和重试入口\n";
+$walletService->getPermissionService()->setOperatorContext([
+    'operator_id' => 2,
+    'dealer_id' => 999,
+    'roles' => ['dealer'],
+    'permissions' => ['wallet:view:own'],
+    'scoped_dealer_ids' => [999],
+]);
+try {
+    $walletService->getWallet($dealerId);
+    echo "  \033[0;31m错误：应该抛出异常但没有\033[0m\n";
+} catch (WalletPermissionException $e) {
+    echo "  \033[0;32m✓ 成功捕获权限异常\033[0m\n";
+    echo "  异常消息：{$e->getMessage()}\n";
+    if ($e->hasRollbackInfo()) {
+        echo "  回滚信息: 存在\n";
+        $rollback = $e->getRollbackInfo();
+        echo "  回滚提示：{$rollback['rollback_message']}\n";
+        foreach ($rollback['rollback_details'] as $detail) {
+            echo "    - {$detail}\n";
+        }
+    } else {
+        echo "  \033[0;33m⚠ 权限异常通常不涉及回滚（还未开始事务）\033[0m\n";
+    }
+    if ($e->hasRetryInfo()) {
+        $retry = $e->getRetryInfo();
+        echo "  重试入口: 存在\n";
+        echo "  重试按钮文字：{$retry['retry_entry']['retry_button_text']}\n";
+        echo "  建议：\n";
+        foreach ($retry['suggestions'] as $suggestion) {
+            echo "    - {$suggestion}\n";
+        }
+    } else {
+        echo "  \033[0;33m⚠ 权限异常不包含重试信息（在事务外抛出）\033[0m\n";
+    }
+    echo "\n";
+}
+
+$walletService->getPermissionService()->setOperatorContext([
+    'operator_id' => 1,
+    'dealer_id' => null,
+    'roles' => ['super_admin'],
+    'permissions' => ['*'],
+    'scoped_dealer_ids' => '*',
+]);
+
+echo "【测试 5】验证操作后钱包状态未受影响（回滚生效）\n";
 $wallet = $walletService->getWallet($dealerId);
 echo "  当前状态：{$wallet['status_name']}\n";
 echo "  当前余额：¥{$wallet['balance']}\n";

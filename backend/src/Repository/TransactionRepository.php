@@ -8,7 +8,8 @@ use PDO;
 
 class TransactionRepository
 {
-    private PDO $pdo;
+    /** @var PDO|MockDatabase */
+    private $pdo;
 
     public function __construct()
     {
