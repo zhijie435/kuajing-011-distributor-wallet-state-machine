@@ -701,10 +701,14 @@ class WalletService
     {
         $maxRetries = 3;
         $retry = 0;
+        $retryDelays = [0, 100, 300];
         while ($retry < $maxRetries) {
             if ($this->walletRepository->update($wallet)) {
                 $this->refreshWallet($wallet);
                 return;
+            }
+            if ($retry < $maxRetries - 1) {
+                usleep($retryDelays[$retry] * 1000);
             }
             $retry++;
             $freshWallet = $this->walletRepository->findById($wallet->id);
@@ -713,7 +717,52 @@ class WalletService
             }
             $this->syncWalletProperties($wallet, $freshWallet);
         }
-        throw new WalletException("钱包更新失败：乐观锁冲突，已重试{$maxRetries}次。请稍后重试。");
+
+        $exception = new WalletException("钱包更新失败：乐观锁冲突，已重试{$maxRetries}次。请稍后重试。");
+        $exception->setRetryInfo([
+            'retryable' => true,
+            'retry_strategy' => 'exponential_backoff',
+            'max_retries' => 3,
+            'retry_delay_ms' => 500,
+            'retry_entry' => [
+                'operation_name' => '钱包更新',
+                'can_retry' => true,
+                'retry_button_text' => '重新提交',
+                'retry_hint' => '建议 500ms 后重试，使用指数退避策略',
+            ],
+            'suggestions' => [
+                '并发操作冲突，请稍后重试',
+                '建议使用指数退避策略，重试间隔 500ms、1s、2s',
+                '如多次失败，请检查是否有高频操作',
+            ],
+            'conflict_details' => [
+                'wallet_id' => $wallet->id,
+                'dealer_id' => $wallet->dealerId,
+                'current_version' => $wallet->version,
+                'retries_attempted' => $maxRetries,
+            ],
+        ]);
+        $exception->setRollbackInfo([
+            'rollback_success' => true,
+            'rollback_time' => date('Y-m-d H:i:s'),
+            'operation_name' => '钱包更新',
+            'operation_type' => 'wallet_update',
+            'error_type' => get_class($exception),
+            'error_message' => $exception->getMessage(),
+            'rollback_message' => '【回滚提示】钱包更新操作因并发冲突失败，所有变更已回滚。',
+            'rollback_details' => [
+                '钱包数据未变更，保持原有状态',
+                '请重新操作或等待几秒后重试',
+            ],
+            'wallet_snapshot' => [
+                'balance' => number_format($wallet->balance, 2, '.', ''),
+                'frozen_amount' => number_format($wallet->frozenAmount, 2, '.', ''),
+                'available_amount' => number_format($wallet->availableAmount, 2, '.', ''),
+                'status' => $wallet->status,
+                'status_name' => \Dealer\Wallet\Enum\WalletStatus::getName($wallet->status),
+            ],
+        ]);
+        throw $exception;
     }
 
     private function refreshWallet(Wallet $wallet): void
