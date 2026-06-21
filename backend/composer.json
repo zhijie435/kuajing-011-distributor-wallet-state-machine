@@ -1,0 +1,15 @@
+{
+    "name": "dealer/wallet",
+    "description": "经销商钱包状态机系统",
+    "type": "project",
+    "require": {
+        "php": ">=7.4",
+        "ext-pdo": "*",
+        "ext-json": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "Dealer\\Wallet\\": "src/"
+        }
+    }
+}
