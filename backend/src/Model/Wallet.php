@@ -48,7 +48,11 @@ class Wallet
     private function sanitizeFromDatabase(): void
     {
         $expectedAvailable = (float)bcsub((string)($this->balance ?? 0), (string)($this->frozenAmount ?? 0), 2);
-        $expectedStatus = WalletStateMachine::calculateStatus((float)($this->balance ?? 0), (float)($this->frozenAmount ?? 0));
+        $expectedStatus = WalletStateMachine::calculateStatus(
+            (float)($this->balance ?? 0),
+            (float)($this->frozenAmount ?? 0),
+            false
+        );
 
         $dbAvailable = $this->availableAmount ?? 0.0;
         $dbStatus = $this->status ?? WalletStatus::NORMAL;
@@ -65,7 +69,7 @@ class Wallet
     public function calculateAvailable(): void
     {
         $this->availableAmount = (float)bcsub((string)$this->balance, (string)$this->frozenAmount, 2);
-        $this->status = WalletStateMachine::calculateStatus($this->balance, $this->frozenAmount);
+        $this->status = WalletStateMachine::calculateStatus($this->balance, $this->frozenAmount, false);
     }
 
     public function toArray(): array

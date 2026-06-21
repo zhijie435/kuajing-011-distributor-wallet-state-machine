@@ -64,9 +64,11 @@ class WalletStateMachine
         }
     }
 
-    public static function calculateStatus(float $balance, float $frozenAmount): int
+    public static function calculateStatus(float $balance, float $frozenAmount, bool $strict = true): int
     {
-        self::validateAmounts($balance, $frozenAmount);
+        if ($strict) {
+            self::validateAmounts($balance, $frozenAmount);
+        }
 
         if ($frozenAmount <= 0.001) {
             return WalletStatus::NORMAL;

@@ -7,6 +7,8 @@ use Dealer\Wallet\Enum\FreezeStatus;
 use Dealer\Wallet\Enum\TransactionType;
 use Dealer\Wallet\Exception\InsufficientBalanceException;
 use Dealer\Wallet\Exception\WalletException;
+use Dealer\Wallet\Exception\WalletPermissionException;
+use Dealer\Wallet\Model\FreezeRecord;
 use Dealer\Wallet\Model\Wallet;
 use Dealer\Wallet\Repository\FreezeRecordRepository;
 use Dealer\Wallet\Repository\TransactionRepository;
@@ -14,6 +16,7 @@ use Dealer\Wallet\Repository\WalletRepository;
 use Dealer\Wallet\Service\ReconciliationService;
 use Dealer\Wallet\StateMachine\WalletStateMachine;
 use PDO;
+use PermissionService;
 
 class WalletService
 {
@@ -21,6 +24,7 @@ class WalletService
     private TransactionRepository $transactionRepository;
     private FreezeRecordRepository $freezeRecordRepository;
     private ReconciliationService $reconciliationService;
+    private PermissionService $permissionService;
     private PDO $pdo;
 
     public function __construct()
@@ -29,13 +33,22 @@ class WalletService
         $this->transactionRepository = new TransactionRepository();
         $this->freezeRecordRepository = new FreezeRecordRepository();
         $this->reconciliationService = new ReconciliationService();
+        $this->permissionService = new PermissionService();
         $this->pdo = Database::getConnection();
+    }
+
+    public function getPermissionService(): PermissionService
+    {
+        return $this->permissionService;
     }
 
     public function getWallet(int $dealerId): array
     {
+        $this->assertCanViewWallet($dealerId);
+
         $wallet = $this->walletRepository->findByDealerId($dealerId);
         if (!$wallet) {
+            $this->assertCanCreateWallet($dealerId);
             $wallet = $this->walletRepository->create($dealerId);
         }
         return $wallet->toArray();
@@ -43,6 +56,10 @@ class WalletService
 
     public function getAllWallets(int $page = 1, int $pageSize = 20): array
     {
+        if (!$this->permissionService->canViewAllWallets()) {
+            throw WalletPermissionException::forAdminRequired('查询全部钱包列表');
+        }
+
         $items = $this->walletRepository->findAll($page, $pageSize);
         $total = $this->walletRepository->count();
         return [
@@ -56,111 +73,79 @@ class WalletService
     public function recharge(int $dealerId, float $amount, array $options = []): array
     {
         $this->validateAmount($amount);
+        $this->assertCanOperateWallet($dealerId, '钱包充值');
 
-        return $this->executeTransaction(function () use ($dealerId, $amount, $options) {
-            $wallet = $this->getOrCreateWalletForUpdate($dealerId);
-
-            $balanceBefore = $wallet->balance;
-            $frozenBefore = $wallet->frozenAmount;
-            $balanceAfter = (float)bcadd((string)$wallet->balance, (string)$amount, 2);
-
-            $stateMachine = new WalletStateMachine($wallet->status);
-            $transition = $stateMachine->assertCanTransitionByAmount($balanceAfter, $frozenBefore, $frozenBefore);
-
-            if ($transition['changed']) {
-                $stateMachine->transition($transition['to_status']);
-            }
-
-            $wallet->balance = $balanceAfter;
-            $wallet->calculateAvailable();
-
-            $this->updateWallet($wallet);
-
-            $this->recordTransaction($wallet, TransactionType::RECHARGE, $amount, $balanceBefore, $balanceAfter, [
-                'frozen_before' => $frozenBefore,
-                'frozen_after' => $wallet->frozenAmount,
-                'operator' => $options['operator'] ?? '',
-                'remark' => ($options['remark'] ?? '') . ($transition['changed'] ? " | {$transition['message']}" : ''),
-                'related_no' => $options['related_no'] ?? '',
-            ]);
-
-            $result = $this->refreshAndReturn($wallet);
-            $result['status_transition'] = $transition;
-            return $result;
-        }, ['dealer_id' => $dealerId, 'amount' => $amount]);
+        return $this->executeBalanceChange(
+            $dealerId,
+            $amount,
+            TransactionType::RECHARGE,
+            true,
+            $options,
+            ['dealer_id' => $dealerId, 'amount' => $amount]
+        );
     }
 
     public function withdraw(int $dealerId, float $amount, array $options = []): array
     {
         $this->validateAmount($amount);
+        $this->assertCanOperateWallet($dealerId, '余额提现');
 
-        return $this->executeTransaction(function () use ($dealerId, $amount, $options) {
-            $wallet = $this->getWalletForUpdate($dealerId);
+        return $this->executeBalanceChange(
+            $dealerId,
+            $amount,
+            TransactionType::WITHDRAW,
+            false,
+            $options,
+            ['dealer_id' => $dealerId, 'amount' => $amount],
+            true
+        );
+    }
 
-            if ($wallet->availableAmount < $amount - 0.001) {
-                throw new InsufficientBalanceException(
-                    "可用余额不足：当前可用 ¥{$wallet->availableAmount}，需提现 ¥{$amount}。" .
-                    "建议：先充值或解冻部分冻结资金。"
-                );
-            }
+    public function consume(int $dealerId, float $amount, array $options = []): array
+    {
+        $this->validateAmount($amount);
+        $this->assertCanOperateWallet($dealerId, '余额消费');
 
-            $balanceBefore = $wallet->balance;
-            $frozenBefore = $wallet->frozenAmount;
-            $balanceAfter = (float)bcsub((string)$wallet->balance, (string)$amount, 2);
+        return $this->executeBalanceChange(
+            $dealerId,
+            $amount,
+            TransactionType::CONSUME,
+            false,
+            $options,
+            ['dealer_id' => $dealerId, 'amount' => $amount],
+            true
+        );
+    }
 
-            $stateMachine = new WalletStateMachine($wallet->status);
-            $transition = $stateMachine->assertCanTransitionByAmount($balanceAfter, $frozenBefore, $frozenBefore);
+    public function refund(int $dealerId, float $amount, array $options = []): array
+    {
+        $this->validateAmount($amount);
+        $this->assertCanOperateWallet($dealerId, '消费退款');
 
-            if ($transition['changed']) {
-                $stateMachine->transition($transition['to_status']);
-            }
-
-            $wallet->balance = $balanceAfter;
-            $wallet->calculateAvailable();
-
-            $this->updateWallet($wallet);
-
-            $this->recordTransaction($wallet, TransactionType::WITHDRAW, $amount, $balanceBefore, $balanceAfter, [
-                'frozen_before' => $frozenBefore,
-                'frozen_after' => $wallet->frozenAmount,
-                'operator' => $options['operator'] ?? '',
-                'remark' => ($options['remark'] ?? '') . ($transition['changed'] ? " | {$transition['message']}" : ''),
-                'related_no' => $options['related_no'] ?? '',
-            ]);
-
-            $result = $this->refreshAndReturn($wallet);
-            $result['status_transition'] = $transition;
-            return $result;
-        }, ['dealer_id' => $dealerId, 'amount' => $amount]);
+        return $this->executeBalanceChange(
+            $dealerId,
+            $amount,
+            TransactionType::REFUND,
+            true,
+            $options,
+            ['dealer_id' => $dealerId, 'amount' => $amount]
+        );
     }
 
     public function freeze(int $dealerId, float $amount, array $options = []): array
     {
         $this->validateAmount($amount);
+        $this->assertCanOperateWallet($dealerId, '资金冻结');
 
         return $this->executeTransaction(function () use ($dealerId, $amount, $options) {
             $wallet = $this->getWalletForUpdate($dealerId);
+            $this->assertSufficientAvailable($wallet, $amount, '冻结');
 
-            if ($wallet->availableAmount < $amount - 0.001) {
-                throw new InsufficientBalanceException(
-                    "可用余额不足：当前可用 ¥{$wallet->availableAmount}，需冻结 ¥{$amount}。" .
-                    "建议：先充值或解冻部分冻结资金。"
-                );
-            }
-
+            $stateMachine = WalletStateMachine::fromWallet($wallet);
             $frozenBefore = $wallet->frozenAmount;
-            $frozenAfter = (float)bcadd((string)$wallet->frozenAmount, (string)$amount, 2);
+            $frozenAfter = (float)bcadd((string)$frozenBefore, (string)$amount, 2);
 
-            $stateMachine = new WalletStateMachine($wallet->status);
-            $transition = $stateMachine->assertCanTransitionByAmount($wallet->balance, $frozenBefore, $frozenAfter);
-
-            if ($transition['changed']) {
-                $stateMachine->transition($transition['to_status']);
-            }
-
-            $wallet->frozenAmount = $frozenAfter;
-            $wallet->calculateAvailable();
-
+            $transition = $stateMachine->applyToWallet($wallet, $wallet->balance, $frozenAfter);
             $this->updateWallet($wallet);
 
             $freezeNo = $this->freezeRecordRepository->generateFreezeNo();
@@ -191,47 +176,29 @@ class WalletService
 
     public function unfreeze(string $freezeNo, float $amount = null, array $options = []): array
     {
-        $freezeRecord = $this->freezeRecordRepository->findByFreezeNo($freezeNo);
-        if (!$freezeRecord) {
-            throw new WalletException("冻结记录不存在：冻结单号【{$freezeNo}】，请核对单号是否正确。");
-        }
-        if ($freezeRecord->status !== FreezeStatus::FROZEN) {
-            throw new WalletException(
-                "冻结记录状态异常：当前状态【" . FreezeStatus::getName($freezeRecord->status) . "】，" .
-                "仅【冻结中】的记录允许解冻。如需重新操作请创建新的冻结单。"
-            );
+        if ($amount !== null) {
+            $this->validateAmount($amount);
         }
 
-        $unfreezeAmount = $amount ?? $freezeRecord->remainingAmount;
-        if ($unfreezeAmount > $freezeRecord->remainingAmount + 0.001) {
-            throw new WalletException(
-                "解冻金额超过剩余冻结金额：剩余冻结 ¥{$freezeRecord->remainingAmount}，申请解冻 ¥{$unfreezeAmount}。" .
-                "请调整解冻金额或分多次解冻。"
-            );
-        }
+        return $this->executeTransaction(function () use ($freezeNo, $amount, $options) {
+            $freezeRecord = $this->findFreezeRecordForUpdate($freezeNo, '解冻');
+            $this->assertCanOperateWallet($freezeRecord->dealerId, '资金解冻');
 
-        $context = [
-            'dealer_id' => $freezeRecord->dealerId,
-            'amount' => $unfreezeAmount,
-            'freeze_no' => $freezeNo,
-        ];
-
-        return $this->executeTransaction(function () use ($freezeNo, $unfreezeAmount, $amount, $options, $freezeRecord) {
             $wallet = $this->getWalletForUpdate($freezeRecord->dealerId);
 
-            $frozenBefore = $wallet->frozenAmount;
-            $frozenAfter = (float)bcsub((string)$wallet->frozenAmount, (string)$unfreezeAmount, 2);
-
-            $stateMachine = new WalletStateMachine($wallet->status);
-            $transition = $stateMachine->assertCanTransitionByAmount($wallet->balance, $frozenBefore, $frozenAfter);
-
-            if ($transition['changed']) {
-                $stateMachine->transition($transition['to_status']);
+            $unfreezeAmount = $amount ?? $freezeRecord->remainingAmount;
+            if ($unfreezeAmount > $freezeRecord->remainingAmount + 0.001) {
+                throw new WalletException(
+                    "解冻金额超过剩余冻结金额：剩余冻结 ¥{$freezeRecord->remainingAmount}，申请解冻 ¥{$unfreezeAmount}。" .
+                    "请调整解冻金额或分多次解冻。"
+                );
             }
 
-            $wallet->frozenAmount = $frozenAfter;
-            $wallet->calculateAvailable();
+            $stateMachine = WalletStateMachine::fromWallet($wallet);
+            $frozenBefore = $wallet->frozenAmount;
+            $frozenAfter = (float)bcsub((string)$frozenBefore, (string)$unfreezeAmount, 2);
 
+            $transition = $stateMachine->applyToWallet($wallet, $wallet->balance, $frozenAfter);
             $this->updateWallet($wallet);
 
             $remainingAfter = (float)bcsub((string)$freezeRecord->remainingAmount, (string)$unfreezeAmount, 2);
@@ -254,136 +221,36 @@ class WalletService
                 'remaining_after' => number_format($remainingAfter, 2, '.', ''),
             ];
             return $result;
-        }, $context);
-    }
-
-    public function consume(int $dealerId, float $amount, array $options = []): array
-    {
-        $this->validateAmount($amount);
-
-        return $this->executeTransaction(function () use ($dealerId, $amount, $options) {
-            $wallet = $this->getWalletForUpdate($dealerId);
-
-            if ($wallet->availableAmount < $amount - 0.001) {
-                throw new InsufficientBalanceException(
-                    "可用余额不足：当前可用 ¥{$wallet->availableAmount}，需消费 ¥{$amount}。" .
-                    "建议：先充值或联系管理员核实可用余额。"
-                );
-            }
-
-            $balanceBefore = $wallet->balance;
-            $frozenBefore = $wallet->frozenAmount;
-            $balanceAfter = (float)bcsub((string)$wallet->balance, (string)$amount, 2);
-
-            $stateMachine = new WalletStateMachine($wallet->status);
-            $transition = $stateMachine->assertCanTransitionByAmount($balanceAfter, $frozenBefore, $frozenBefore);
-
-            if ($transition['changed']) {
-                $stateMachine->transition($transition['to_status']);
-            }
-
-            $wallet->balance = $balanceAfter;
-            $wallet->calculateAvailable();
-
-            $this->updateWallet($wallet);
-
-            $this->recordTransaction($wallet, TransactionType::CONSUME, $amount, $balanceBefore, $balanceAfter, [
-                'frozen_before' => $frozenBefore,
-                'frozen_after' => $wallet->frozenAmount,
-                'operator' => $options['operator'] ?? '',
-                'remark' => ($options['remark'] ?? '') . ($transition['changed'] ? " | {$transition['message']}" : ''),
-                'related_no' => $options['related_no'] ?? '',
-            ]);
-
-            $result = $this->refreshAndReturn($wallet);
-            $result['status_transition'] = $transition;
-            return $result;
-        }, ['dealer_id' => $dealerId, 'amount' => $amount]);
-    }
-
-    public function refund(int $dealerId, float $amount, array $options = []): array
-    {
-        $this->validateAmount($amount);
-
-        return $this->executeTransaction(function () use ($dealerId, $amount, $options) {
-            $wallet = $this->getWalletForUpdate($dealerId);
-
-            $balanceBefore = $wallet->balance;
-            $frozenBefore = $wallet->frozenAmount;
-            $balanceAfter = (float)bcadd((string)$wallet->balance, (string)$amount, 2);
-
-            $stateMachine = new WalletStateMachine($wallet->status);
-            $transition = $stateMachine->assertCanTransitionByAmount($balanceAfter, $frozenBefore, $frozenBefore);
-
-            if ($transition['changed']) {
-                $stateMachine->transition($transition['to_status']);
-            }
-
-            $wallet->balance = $balanceAfter;
-            $wallet->calculateAvailable();
-
-            $this->updateWallet($wallet);
-
-            $this->recordTransaction($wallet, TransactionType::REFUND, $amount, $balanceBefore, $balanceAfter, [
-                'frozen_before' => $frozenBefore,
-                'frozen_after' => $wallet->frozenAmount,
-                'operator' => $options['operator'] ?? '',
-                'remark' => ($options['remark'] ?? '') . ($transition['changed'] ? " | {$transition['message']}" : ''),
-                'related_no' => $options['related_no'] ?? '',
-            ]);
-
-            $result = $this->refreshAndReturn($wallet);
-            $result['status_transition'] = $transition;
-            return $result;
-        }, ['dealer_id' => $dealerId, 'amount' => $amount]);
+        }, ['freeze_no' => $freezeNo, 'amount' => $amount]);
     }
 
     public function deductFrozen(string $freezeNo, float $amount = null, array $options = []): array
     {
-        $freezeRecord = $this->freezeRecordRepository->findByFreezeNo($freezeNo);
-        if (!$freezeRecord) {
-            throw new WalletException("冻结记录不存在：冻结单号【{$freezeNo}】，请核对单号是否正确。");
-        }
-        if ($freezeRecord->status !== FreezeStatus::FROZEN) {
-            throw new WalletException(
-                "冻结记录状态异常：当前状态【" . FreezeStatus::getName($freezeRecord->status) . "】，" .
-                "仅【冻结中】的记录允许扣除。如需重新操作请创建新的冻结单。"
-            );
+        if ($amount !== null) {
+            $this->validateAmount($amount);
         }
 
-        $deductAmount = $amount ?? $freezeRecord->remainingAmount;
-        if ($deductAmount > $freezeRecord->remainingAmount + 0.001) {
-            throw new WalletException(
-                "扣除金额超过剩余冻结金额：剩余冻结 ¥{$freezeRecord->remainingAmount}，申请扣除 ¥{$deductAmount}。" .
-                "请调整扣除金额。"
-            );
-        }
+        return $this->executeTransaction(function () use ($freezeNo, $amount, $options) {
+            $freezeRecord = $this->findFreezeRecordForUpdate($freezeNo, '扣除');
+            $this->assertCanOperateWallet($freezeRecord->dealerId, '冻结资金扣除');
 
-        $context = [
-            'dealer_id' => $freezeRecord->dealerId,
-            'amount' => $deductAmount,
-            'freeze_no' => $freezeNo,
-        ];
-
-        return $this->executeTransaction(function () use ($freezeNo, $deductAmount, $amount, $options, $freezeRecord) {
             $wallet = $this->getWalletForUpdate($freezeRecord->dealerId);
 
-            $balanceBefore = $wallet->balance;
-            $balanceAfter = (float)bcsub((string)$wallet->balance, (string)$deductAmount, 2);
-            $frozenBefore = $wallet->frozenAmount;
-            $frozenAfter = (float)bcsub((string)$wallet->frozenAmount, (string)$deductAmount, 2);
-
-            $stateMachine = new WalletStateMachine($wallet->status);
-            $transition = $stateMachine->assertCanTransitionByAmount($balanceAfter, $frozenBefore, $frozenAfter);
-
-            if ($transition['changed']) {
-                $stateMachine->transition($transition['to_status']);
+            $deductAmount = $amount ?? $freezeRecord->remainingAmount;
+            if ($deductAmount > $freezeRecord->remainingAmount + 0.001) {
+                throw new WalletException(
+                    "扣除金额超过剩余冻结金额：剩余冻结 ¥{$freezeRecord->remainingAmount}，申请扣除 ¥{$deductAmount}。" .
+                    "请调整扣除金额。"
+                );
             }
 
-            $wallet->balance = $balanceAfter;
-            $wallet->frozenAmount = $frozenAfter;
-            $wallet->calculateAvailable();
+            $stateMachine = WalletStateMachine::fromWallet($wallet);
+            $balanceBefore = $wallet->balance;
+            $balanceAfter = (float)bcsub((string)$balanceBefore, (string)$deductAmount, 2);
+            $frozenBefore = $wallet->frozenAmount;
+            $frozenAfter = (float)bcsub((string)$frozenBefore, (string)$deductAmount, 2);
 
+            $transition = $stateMachine->applyToWallet($wallet, $balanceAfter, $frozenAfter);
             $this->updateWallet($wallet);
 
             $remainingAfter = (float)bcsub((string)$freezeRecord->remainingAmount, (string)$deductAmount, 2);
@@ -406,11 +273,19 @@ class WalletService
                 'remaining_after' => number_format($remainingAfter, 2, '.', ''),
             ];
             return $result;
-        }, $context);
+        }, ['freeze_no' => $freezeNo, 'amount' => $amount]);
     }
 
     public function getTransactions(int $dealerId, int $page = 1, int $pageSize = 20): array
     {
+        if (!$this->permissionService->canViewTransactions($dealerId)) {
+            $currentDealerId = $this->permissionService->getCurrentDealerId();
+            if ($currentDealerId !== null) {
+                throw WalletPermissionException::forDealerMismatch($dealerId, $currentDealerId);
+            }
+            throw WalletPermissionException::forAdminRequired('查询交易流水');
+        }
+
         $wallet = $this->getOrCreateWallet($dealerId);
         $items = $this->transactionRepository->findByWalletId($wallet->id, $page, $pageSize);
         $total = $this->transactionRepository->countByWalletId($wallet->id);
@@ -424,10 +299,20 @@ class WalletService
 
     public function getFreezeRecords(int $dealerId, int $status = null, int $page = 1, int $pageSize = 20): array
     {
+        if (!$this->permissionService->canViewFreezeRecords($dealerId)) {
+            $currentDealerId = $this->permissionService->getCurrentDealerId();
+            if ($currentDealerId !== null) {
+                throw WalletPermissionException::forDealerMismatch($dealerId, $currentDealerId);
+            }
+            throw WalletPermissionException::forAdminRequired('查询冻结记录');
+        }
+
         $wallet = $this->getOrCreateWallet($dealerId);
         $items = $this->freezeRecordRepository->findByWalletId($wallet->id, $status, $page, $pageSize);
+        $total = count($items);
         return [
             'items' => $items,
+            'total' => $total,
             'page' => $page,
             'page_size' => $pageSize,
         ];
@@ -435,6 +320,8 @@ class WalletService
 
     public function getStateTransitions(int $dealerId): array
     {
+        $this->assertCanViewWallet($dealerId);
+
         $wallet = $this->getOrCreateWallet($dealerId);
         $allowedTransitions = WalletStateMachine::getAllowedTransitions($wallet->status);
         $transitions = [];
@@ -454,21 +341,33 @@ class WalletService
 
     public function reconcileFreezeRecords(int $dealerId): array
     {
+        if (!$this->permissionService->canReconcile($dealerId)) {
+            throw WalletPermissionException::forAdminRequired('冻结释放对账');
+        }
         return $this->reconciliationService->reconcileFreezeRecords($dealerId);
     }
 
     public function reconcileBalanceChanges(int $dealerId): array
     {
+        if (!$this->permissionService->canReconcile($dealerId)) {
+            throw WalletPermissionException::forAdminRequired('余额变更对账');
+        }
         return $this->reconciliationService->reconcileBalanceChanges($dealerId);
     }
 
     public function getAnomalySummary(int $dealerId): array
     {
+        if (!$this->permissionService->canReconcile($dealerId)) {
+            throw WalletPermissionException::forAdminRequired('异常汇总查询');
+        }
         return $this->reconciliationService->getAnomalySummary($dealerId);
     }
 
     public function exportFreezeReconciliation(int $dealerId): array
     {
+        if (!$this->permissionService->canExport($dealerId)) {
+            throw WalletPermissionException::forAdminRequired('冻结对账导出');
+        }
         $csv = $this->reconciliationService->exportFreezeReconciliationCsv($dealerId);
         $filename = sprintf('freeze_reconciliation_dealer_%d_%s.csv', $dealerId, date('YmdHis'));
         return [
@@ -480,6 +379,9 @@ class WalletService
 
     public function exportBalanceReconciliation(int $dealerId): array
     {
+        if (!$this->permissionService->canExport($dealerId)) {
+            throw WalletPermissionException::forAdminRequired('余额对账导出');
+        }
         $csv = $this->reconciliationService->exportBalanceReconciliationCsv($dealerId);
         $filename = sprintf('balance_reconciliation_dealer_%d_%s.csv', $dealerId, date('YmdHis'));
         return [
@@ -491,7 +393,116 @@ class WalletService
 
     public function fixWalletInconsistency(int $dealerId, string $operator = 'reconciliation'): array
     {
+        if (!$this->permissionService->canFixWallet($dealerId)) {
+            throw WalletPermissionException::forAdminRequired('钱包不一致修复');
+        }
         return $this->reconciliationService->fixWalletInconsistency($dealerId, $operator);
+    }
+
+    private function executeBalanceChange(
+        int $dealerId,
+        float $amount,
+        int $txType,
+        bool $isIncrease,
+        array $options,
+        array $context,
+        bool $checkAvailable = false
+    ): array {
+        return $this->executeTransaction(function () use ($dealerId, $amount, $txType, $isIncrease, $options, $checkAvailable) {
+            $wallet = $this->getWalletForUpdate($dealerId);
+
+            if ($checkAvailable) {
+                $actionName = $txType === TransactionType::WITHDRAW ? '提现' : '消费';
+                $this->assertSufficientAvailable($wallet, $amount, $actionName);
+            }
+
+            $balanceBefore = $wallet->balance;
+            $frozenBefore = $wallet->frozenAmount;
+            $balanceAfter = $isIncrease
+                ? (float)bcadd((string)$balanceBefore, (string)$amount, 2)
+                : (float)bcsub((string)$balanceBefore, (string)$amount, 2);
+
+            $stateMachine = WalletStateMachine::fromWallet($wallet);
+            $transition = $stateMachine->applyToWallet($wallet, $balanceAfter, $frozenBefore);
+
+            $this->updateWallet($wallet);
+
+            $this->recordTransaction($wallet, $txType, $amount, $balanceBefore, $balanceAfter, [
+                'frozen_before' => $frozenBefore,
+                'frozen_after' => $wallet->frozenAmount,
+                'operator' => $options['operator'] ?? '',
+                'remark' => ($options['remark'] ?? '') . ($transition['changed'] ? " | {$transition['message']}" : ''),
+                'related_no' => $options['related_no'] ?? '',
+            ]);
+
+            $result = $this->refreshAndReturn($wallet);
+            $result['status_transition'] = $transition;
+            return $result;
+        }, $context);
+    }
+
+    private function findFreezeRecordForUpdate(string $freezeNo, string $actionName): FreezeRecord
+    {
+        $freezeRecord = $this->freezeRecordRepository->findByFreezeNo($freezeNo);
+        if (!$freezeRecord) {
+            throw new WalletException("冻结记录不存在：冻结单号【{$freezeNo}】，请核对单号是否正确。");
+        }
+        if ($freezeRecord->status !== FreezeStatus::FROZEN) {
+            throw new WalletException(
+                "冻结记录状态异常：当前状态【" . FreezeStatus::getName($freezeRecord->status) . "】，" .
+                "仅【冻结中】的记录允许{$actionName}。如需重新操作请创建新的冻结单。"
+            );
+        }
+        return $freezeRecord;
+    }
+
+    private function assertCanViewWallet(int $dealerId): void
+    {
+        if (!$this->permissionService->canViewWallet($dealerId)) {
+            $currentDealerId = $this->permissionService->getCurrentDealerId();
+            if ($currentDealerId !== null) {
+                throw WalletPermissionException::forDealerMismatch($dealerId, $currentDealerId);
+            }
+            throw WalletPermissionException::forAdminRequired('查询钱包信息');
+        }
+    }
+
+    private function assertCanOperateWallet(int $dealerId, string $operationName): void
+    {
+        if ($this->permissionService->isAdmin()) {
+            return;
+        }
+        if (!$this->permissionService->canViewWallet($dealerId)) {
+            $currentDealerId = $this->permissionService->getCurrentDealerId();
+            if ($currentDealerId !== null) {
+                throw WalletPermissionException::forDealerMismatch($dealerId, $currentDealerId);
+            }
+            throw WalletPermissionException::forAdminRequired($operationName);
+        }
+    }
+
+    private function assertCanCreateWallet(int $dealerId): void
+    {
+        if ($this->permissionService->isAdmin()) {
+            return;
+        }
+        $currentDealerId = $this->permissionService->getCurrentDealerId();
+        if ($currentDealerId === null) {
+            throw WalletPermissionException::forAdminRequired('创建钱包');
+        }
+        if ($dealerId !== $currentDealerId) {
+            throw WalletPermissionException::forDealerMismatch($dealerId, $currentDealerId);
+        }
+    }
+
+    private function assertSufficientAvailable(Wallet $wallet, float $amount, string $action): void
+    {
+        if ($wallet->availableAmount < $amount - 0.001) {
+            throw new InsufficientBalanceException(
+                "可用余额不足：当前可用 ¥{$wallet->availableAmount}，需{$action} ¥{$amount}。" .
+                "建议：先充值或解冻部分冻结资金。"
+            );
+        }
     }
 
     private function executeTransaction(callable $callback, array $operationContext = [])
@@ -540,6 +551,7 @@ class WalletService
             'consume' => '余额消费',
             'refund' => '消费退款',
             'deductFrozen' => '冻结资金扣除',
+            'executeBalanceChange' => '余额变更',
         ];
         return $map[$method] ?? $method;
     }
@@ -554,6 +566,7 @@ class WalletService
             'consume' => 'balance_decrease',
             'refund' => 'balance_increase',
             'deductFrozen' => 'freeze_decrease',
+            'executeBalanceChange' => 'balance_change',
         ];
         return $map[$method] ?? 'unknown';
     }
@@ -606,6 +619,8 @@ class WalletService
             $info['rollback_details'][] = '失败原因：可用余额不足，本次操作未执行';
         } elseif ($e instanceof \Dealer\Wallet\Exception\WalletStateException) {
             $info['rollback_details'][] = '失败原因：状态流转校验失败，请检查金额或处理现有冻结单';
+        } elseif ($e instanceof \Dealer\Wallet\Exception\WalletPermissionException) {
+            $info['rollback_details'][] = '失败原因：权限校验失败，请使用有权限的账号操作';
         }
 
         return $info;
@@ -627,6 +642,10 @@ class WalletService
             $retryable = false;
             $suggestions[] = '请调整操作金额，避免触发非法状态流转';
             $suggestions[] = '如需继续操作，请先处理现有异常冻结单';
+        } elseif ($e instanceof \Dealer\Wallet\Exception\WalletPermissionException) {
+            $retryable = false;
+            $suggestions[] = '请使用有权限的账号重新登录后操作';
+            $suggestions[] = '如需临时授权，请联系管理员开通数据访问权限';
         } elseif (strpos($e->getMessage(), '乐观锁冲突') !== false) {
             $retryable = true;
             $retryStrategy = 'exponential_backoff';

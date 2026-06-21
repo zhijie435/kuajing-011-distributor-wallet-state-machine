@@ -106,9 +106,9 @@ class MockDatabase
         self::$instance = new self();
     }
 
-    public function getConnection()
+    public static function getConnection()
     {
-        return $this;
+        return self::getInstance();
     }
 
     public static function __callStatic($name, $arguments)
