@@ -17,12 +17,22 @@ class WalletRepository
 
     public function findByDealerId(int $dealerId): ?Wallet
     {
+        $sql = "SELECT * FROM dealer_wallet WHERE dealer_id = :dealer_id";
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->bindValue(':dealer_id', $dealerId, PDO::PARAM_INT);
+        $stmt->execute();
+        $data = $stmt->fetch();
+        return $data ? new Wallet($data, true) : null;
+    }
+
+    public function findByDealerIdForUpdate(int $dealerId): ?Wallet
+    {
         $sql = "SELECT * FROM dealer_wallet WHERE dealer_id = :dealer_id FOR UPDATE";
         $stmt = $this->pdo->prepare($sql);
         $stmt->bindValue(':dealer_id', $dealerId, PDO::PARAM_INT);
         $stmt->execute();
         $data = $stmt->fetch();
-        return $data ? new Wallet($data) : null;
+        return $data ? new Wallet($data, true) : null;
     }
 
     public function findById(int $id): ?Wallet
@@ -32,7 +42,7 @@ class WalletRepository
         $stmt->bindValue(':id', $id, PDO::PARAM_INT);
         $stmt->execute();
         $data = $stmt->fetch();
-        return $data ? new Wallet($data) : null;
+        return $data ? new Wallet($data, true) : null;
     }
 
     public function findAll(int $page = 1, int $pageSize = 20): array
@@ -45,7 +55,7 @@ class WalletRepository
         $stmt->execute();
         $items = [];
         while ($data = $stmt->fetch()) {
-            $items[] = (new Wallet($data))->toArray();
+            $items[] = (new Wallet($data, true))->toArray();
         }
         return $items;
     }
@@ -77,9 +87,9 @@ class WalletRepository
                     version = version + 1 
                 WHERE id = :id AND version = :version";
         $stmt = $this->pdo->prepare($sql);
-        $stmt->bindValue(':balance', $wallet->balance);
-        $stmt->bindValue(':frozen_amount', $wallet->frozenAmount);
-        $stmt->bindValue(':available_amount', $wallet->availableAmount);
+        $stmt->bindValue(':balance', number_format($wallet->balance, 2, '.', ''));
+        $stmt->bindValue(':frozen_amount', number_format($wallet->frozenAmount, 2, '.', ''));
+        $stmt->bindValue(':available_amount', number_format($wallet->availableAmount, 2, '.', ''));
         $stmt->bindValue(':status', $wallet->status, PDO::PARAM_INT);
         $stmt->bindValue(':id', $wallet->id, PDO::PARAM_INT);
         $stmt->bindValue(':version', $wallet->version, PDO::PARAM_INT);
