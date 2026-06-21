@@ -188,11 +188,13 @@ class MockDatabase
         $rows = $this->tables[$table];
         
         $joinMatches = [];
-        if (preg_match_all('/(INNER|LEFT|RIGHT)?\s*JOIN\s+(\w+)\s+ON\s+(.+?)(?:\s+(?:WHERE|GROUP|ORDER|LIMIT|$))/is', $sql, $joinMatches, PREG_SET_ORDER)) {
+        if (preg_match_all('/(INNER|LEFT|RIGHT)?\s*JOIN\s+(\w+)[^O]*ON\s+(.+?)(?:\s+WHERE|\s+GROUP|\s+ORDER|\s+LIMIT|$)/is', $sql, $joinMatches, PREG_SET_ORDER)) {
             foreach ($joinMatches as $joinMatch) {
                 $joinTable = $joinMatch[2];
                 $onCondition = trim($joinMatch[3]);
                 $joinType = strtoupper($joinMatch[1] ?? 'INNER');
+                
+                $onCondition = preg_replace('/\s+(WHERE|GROUP|ORDER|LIMIT)\s*.*$/is', '', $onCondition);
                 
                 if (isset($this->tables[$joinTable])) {
                     $rows = $this->joinTables($rows, $this->tables[$joinTable], $onCondition, $joinType);

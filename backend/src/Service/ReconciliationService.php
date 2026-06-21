@@ -498,3 +498,415 @@ class ReconciliationService
             $expected = bcadd((string)$tx->frozenBefore, (string)$tx->amount, 2);
             if (abs((float)$expected - $tx->frozenAfter) > 0.001) {
                 $anomalies[] = [
+                    'severity' => self::SEVERITY_ERROR,
+                    'code' => 'TX_FROZEN_ARITHMETIC',
+                    'transaction_id' => $tx->id,
+                    'message' => sprintf(
+                        '交易ID[%d]【冻结】冻结计算异常：frozen_before(¥%.2f) + amount(¥%.2f) = ¥%.2f ≠ frozen_after(¥%.2f)',
+                        $tx->id,
+                        $tx->frozenBefore,
+                        $tx->amount,
+                        (float)$expected,
+                        $tx->frozenAfter
+                    ),
+                ];
+                $ok = false;
+            }
+        }
+
+        if ($type === TransactionType::UNFREEZE) {
+            $expected = bcsub((string)$tx->frozenBefore, (string)$tx->amount, 2);
+            if (abs((float)$expected - $tx->frozenAfter) > 0.001) {
+                $anomalies[] = [
+                    'severity' => self::SEVERITY_ERROR,
+                    'code' => 'TX_FROZEN_ARITHMETIC',
+                    'transaction_id' => $tx->id,
+                    'message' => sprintf(
+                        '交易ID[%d]【解冻】冻结计算异常：frozen_before(¥%.2f) - amount(¥%.2f) = ¥%.2f ≠ frozen_after(¥%.2f)',
+                        $tx->id,
+                        $tx->frozenBefore,
+                        $tx->amount,
+                        (float)$expected,
+                        $tx->frozenAfter
+                    ),
+                ];
+                $ok = false;
+            }
+        }
+
+        return $ok;
+    }
+
+    private function checkTransactionChain(Transaction $tx, $prevBalanceAfter, $prevFrozenAfter, array &$anomalies, int $index): bool
+    {
+        if ($index === 0) {
+            return true;
+        }
+
+        $ok = true;
+
+        if ($prevBalanceAfter !== null && abs($prevBalanceAfter - $tx->balanceBefore) > 0.001) {
+            $anomalies[] = [
+                'severity' => self::SEVERITY_ERROR,
+                'code' => 'TX_CHAIN_BALANCE_BROKEN',
+                'transaction_id' => $tx->id,
+                'message' => sprintf(
+                    '交易ID[%d]流水链断裂：上一笔balance_after(¥%.2f) ≠ 当前balance_before(¥%.2f)，差额¥%.2f',
+                    $tx->id,
+                    $prevBalanceAfter,
+                    $tx->balanceBefore,
+                    $tx->balanceBefore - $prevBalanceAfter
+                ),
+            ];
+            $ok = false;
+        }
+
+        if ($prevFrozenAfter !== null && abs($prevFrozenAfter - $tx->frozenBefore) > 0.001) {
+            $anomalies[] = [
+                'severity' => self::SEVERITY_ERROR,
+                'code' => 'TX_CHAIN_FROZEN_BROKEN',
+                'transaction_id' => $tx->id,
+                'message' => sprintf(
+                    '交易ID[%d]冻结链断裂：上一笔frozen_after(¥%.2f) ≠ 当前frozen_before(¥%.2f)，差额¥%.2f',
+                    $tx->id,
+                    $prevFrozenAfter,
+                    $tx->frozenBefore,
+                    $tx->frozenBefore - $prevFrozenAfter
+                ),
+            ];
+            $ok = false;
+        }
+
+        return $ok;
+    }
+
+    private function applyTransactionToRunningTotal(Transaction $tx, float &$balance, float &$frozen): void
+    {
+        switch ($tx->type) {
+            case TransactionType::RECHARGE:
+            case TransactionType::REFUND:
+                $balance = (float)bcadd((string)$balance, (string)$tx->amount, 2);
+                break;
+            case TransactionType::WITHDRAW:
+            case TransactionType::CONSUME:
+                $balance = (float)bcsub((string)$balance, (string)$tx->amount, 2);
+                break;
+            case TransactionType::FREEZE:
+                $frozen = (float)bcadd((string)$frozen, (string)$tx->amount, 2);
+                break;
+            case TransactionType::UNFREEZE:
+                $frozen = (float)bcsub((string)$frozen, (string)$tx->amount, 2);
+                break;
+        }
+    }
+
+    private function accumulateTypeTotals(
+        Transaction $tx,
+        float &$recharge,
+        float &$withdraw,
+        float &$consume,
+        float &$refund,
+        float &$freeze,
+        float &$unfreeze
+    ): void {
+        switch ($tx->type) {
+            case TransactionType::RECHARGE:
+                $recharge += $tx->amount;
+                break;
+            case TransactionType::WITHDRAW:
+                $withdraw += $tx->amount;
+                break;
+            case TransactionType::CONSUME:
+                $consume += $tx->amount;
+                break;
+            case TransactionType::REFUND:
+                $refund += $tx->amount;
+                break;
+            case TransactionType::FREEZE:
+                $freeze += $tx->amount;
+                break;
+            case TransactionType::UNFREEZE:
+                $unfreeze += $tx->amount;
+                break;
+        }
+    }
+
+    public function exportFreezeReconciliationCsv(int $dealerId): string
+    {
+        $result = $this->reconcileFreezeRecords($dealerId);
+        $lines = [];
+
+        $lines[] = $this->csvRow([
+            '===== 冻结释放核对汇总 =====',
+        ]);
+        $lines[] = '';
+
+        $summary = $result['data']['summary'] ?? [];
+        foreach ($summary as $k => $v) {
+            $lines[] = $this->csvRow([$k, $v]);
+        }
+        $lines[] = '';
+
+        $lines[] = $this->csvRow([
+            '===== 异常列表 =====',
+        ]);
+        if (!empty($result['anomalies'])) {
+            $lines[] = $this->csvRow(['严重级别', '异常代码', '关联单号', '异常描述']);
+            foreach ($result['anomalies'] as $a) {
+                $lines[] = $this->csvRow([
+                    $a['severity'],
+                    $a['code'] ?? '',
+                    $a['freeze_no'] ?? $a['transaction_id'] ?? '',
+                    $a['message'],
+                ]);
+            }
+        } else {
+            $lines[] = $this->csvRow(['无异常，核对通过']);
+        }
+        $lines[] = '';
+
+        $lines[] = $this->csvRow([
+            '===== 冻结记录明细 =====',
+        ]);
+        $lines[] = $this->csvRow([
+            '冻结单号', '经销商ID', '冻结金额', '剩余金额', '状态',
+            '已解冻总额', '已扣除总额', '已释放总额', '预期剩余',
+            '冻结原因', '操作人', '创建时间',
+        ]);
+        foreach (($result['data']['records'] ?? []) as $r) {
+            $rec = $r['record'];
+            $lines[] = $this->csvRow([
+                $rec['freeze_no'],
+                $rec['dealer_id'],
+                $rec['amount'],
+                $rec['remaining_amount'],
+                $rec['status_name'],
+                $r['sum_unfreeze'],
+                $r['sum_deduct'],
+                $r['released_total'],
+                $r['expected_remaining'],
+                $rec['reason'],
+                $rec['operator'],
+                $rec['created_at'],
+            ]);
+
+            if (!empty($r['transactions'])) {
+                $lines[] = $this->csvRow([
+                    '-- 关联交易明细 --', '', '', '', '', '', '', '', '', '', '', '',
+                ]);
+                $lines[] = $this->csvRow([
+                    '  交易ID', '类型', '金额', '变更前余额', '变更后余额',
+                    '变更前冻结', '变更后冻结', '操作人', '备注', '创建时间',
+                ]);
+                foreach ($r['transactions'] as $tx) {
+                    $lines[] = $this->csvRow([
+                        '  ' . $tx['id'],
+                        $tx['type_name'],
+                        $tx['amount'],
+                        $tx['balance_before'],
+                        $tx['balance_after'],
+                        $tx['frozen_before'],
+                        $tx['frozen_after'],
+                        $tx['operator'],
+                        $tx['remark'],
+                        $tx['created_at'],
+                    ]);
+                }
+                $lines[] = '';
+            }
+        }
+
+        return implode("\n", $lines);
+    }
+
+    public function exportBalanceReconciliationCsv(int $dealerId): string
+    {
+        $result = $this->reconcileBalanceChanges($dealerId);
+        $lines = [];
+
+        $lines[] = $this->csvRow([
+            '===== 余额变更核对汇总 =====',
+        ]);
+        $lines[] = '';
+
+        $summary = $result['data']['summary'] ?? [];
+        foreach ($summary as $k => $v) {
+            $lines[] = $this->csvRow([$k, $v]);
+        }
+        $lines[] = '';
+
+        $lines[] = $this->csvRow([
+            '===== 异常列表 =====',
+        ]);
+        if (!empty($result['anomalies'])) {
+            $lines[] = $this->csvRow(['严重级别', '异常代码', '关联交易ID', '异常描述']);
+            foreach ($result['anomalies'] as $a) {
+                $lines[] = $this->csvRow([
+                    $a['severity'],
+                    $a['code'] ?? '',
+                    $a['transaction_id'] ?? '',
+                    $a['message'],
+                ]);
+            }
+        } else {
+            $lines[] = $this->csvRow(['无异常，核对通过']);
+        }
+        $lines[] = '';
+
+        $lines[] = $this->csvRow([
+            '===== 余额变更流水明细 =====',
+        ]);
+        $lines[] = $this->csvRow([
+            '序号', '交易ID', '类型', '方向', '金额',
+            '变更前余额', '变更后余额', '变更前冻结', '变更后冻结',
+            '累计余额', '累计冻结',
+            '关联单号', '操作人', '备注', '创建时间', '余额勾稽', '链勾稽',
+        ]);
+        $index = 1;
+        foreach (($result['data']['transactions'] ?? []) as $tx) {
+            $lines[] = $this->csvRow([
+                $index++,
+                $tx['id'],
+                $tx['type_name'],
+                $tx['direction'],
+                $tx['amount'],
+                $tx['balance_before'],
+                $tx['balance_after'],
+                $tx['frozen_before'],
+                $tx['frozen_after'],
+                $tx['running_balance'],
+                $tx['running_frozen'],
+                $tx['related_no'],
+                $tx['operator'],
+                $tx['remark'],
+                $tx['created_at'],
+                $tx['checks']['balance_ok'] ? 'OK' : 'ERROR',
+                $tx['checks']['chain_ok'] ? 'OK' : 'ERROR',
+            ]);
+        }
+
+        return implode("\n", $lines);
+    }
+
+    public function getAnomalySummary(int $dealerId): array
+    {
+        $freezeResult = $this->reconcileFreezeRecords($dealerId);
+        $balanceResult = $this->reconcileBalanceChanges($dealerId);
+
+        $allAnomalies = array_merge(
+            $freezeResult['anomalies'] ?? [],
+            $balanceResult['anomalies'] ?? []
+        );
+
+        $errorCount = $this->countSeverity($allAnomalies, self::SEVERITY_ERROR);
+        $warningCount = $this->countSeverity($allAnomalies, self::SEVERITY_WARNING);
+
+        $level = 'normal';
+        if ($errorCount > 0) {
+            $level = 'critical';
+        } elseif ($warningCount > 0) {
+            $level = 'warning';
+        }
+
+        return [
+            'dealer_id' => $dealerId,
+            'level' => $level,
+            'level_name' => [
+                'normal' => '正常',
+                'warning' => '警告',
+                'critical' => '严重',
+            ][$level],
+            'total_anomalies' => count($allAnomalies),
+            'error_count' => $errorCount,
+            'warning_count' => $warningCount,
+            'freeze_check' => [
+                'passed' => $freezeResult['success'],
+                'anomaly_count' => count($freezeResult['anomalies'] ?? []),
+            ],
+            'balance_check' => [
+                'passed' => $balanceResult['success'],
+                'anomaly_count' => count($balanceResult['anomalies'] ?? []),
+            ],
+            'anomalies' => $allAnomalies,
+            'tips' => $this->generateTips($allAnomalies),
+        ];
+    }
+
+    private function generateTips(array $anomalies): array
+    {
+        $tips = [];
+        $codes = array_column($anomalies, 'code');
+
+        if (in_array('FINAL_BALANCE_MISMATCH', $codes, true) || in_array('RUNNING_BALANCE_MISMATCH', $codes, true)) {
+            $tips[] = '存在余额累计不一致问题，建议逐条检查交易流水的 balance_before/balance_after 是否与金额运算匹配，确认是否存在手工改库或丢失交易记录';
+        }
+        if (in_array('FINAL_FROZEN_MISMATCH', $codes, true) || in_array('FREEZE_SUM_MISMATCH', $codes, true)) {
+            $tips[] = '存在冻结金额不一致问题，建议检查冻结记录状态流转是否完整，解冻/扣除操作是否同步更新冻结表';
+        }
+        if (in_array('TX_CHAIN_BALANCE_BROKEN', $codes, true) || in_array('TX_CHAIN_FROZEN_BROKEN', $codes, true)) {
+            $tips[] = '流水链断裂通常意味着存在缺失交易记录或并发写入顺序异常，建议根据交易ID区间排查是否存在漏记';
+        }
+        if (in_array('FREEZE_TX_MISSING', $codes, true)) {
+            $tips[] = '存在冻结单缺少对应交易流水，可能是冻结记录被手工创建，需补录对应交易流水保证账目一致性';
+        }
+        if (in_array('REMAINING_AMOUNT_MISMATCH', $codes, true) || in_array('FREEZE_TOTAL_MISMATCH', $codes, true)) {
+            $tips[] = '冻结单剩余金额勾稽异常，建议按冻结单维度重算：冻结金额 - 解冻金额 - 扣除金额 = 剩余金额';
+        }
+        if (in_array('FREEZE_STATUS_INCONSISTENT', $codes, true)) {
+            $tips[] = '冻结状态与剩余金额不匹配，剩余为0应标记已解冻/已扣除，剩余>0应为冻结中，请修复状态';
+        }
+        if (in_array('AVAILABLE_AMOUNT_MISMATCH', $codes, true)) {
+            $tips[] = '可用余额字段冗余存储异常，可通过重新计算 balance - frozen_amount 修复';
+        }
+
+        if (empty($tips)) {
+            $tips[] = '核对未发现异常，账目数据一致性良好';
+        }
+
+        return $tips;
+    }
+
+    private function buildResult(bool $success, array $anomalies = [], array $errors = [], array $data = []): array
+    {
+        return [
+            'success' => $success,
+            'anomalies' => $anomalies,
+            'errors' => $errors,
+            'data' => $data,
+        ];
+    }
+
+    private function hasSeverity(array $anomalies, string $severity): bool
+    {
+        foreach ($anomalies as $a) {
+            if (($a['severity'] ?? '') === $severity) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private function countSeverity(array $anomalies, string $severity): int
+    {
+        $count = 0;
+        foreach ($anomalies as $a) {
+            if (($a['severity'] ?? '') === $severity) {
+                $count++;
+            }
+        }
+        return $count;
+    }
+
+    private function csvRow(array $fields): string
+    {
+        $escaped = [];
+        foreach ($fields as $f) {
+            $s = (string)$f;
+            if (strpos($s, ',') !== false || strpos($s, '"') !== false || strpos($s, "\n") !== false) {
+                $s = '"' . str_replace('"', '""', $s) . '"';
+            }
+            $escaped[] = $s;
+        }
+        return implode(',', $escaped);
+    }
+}
