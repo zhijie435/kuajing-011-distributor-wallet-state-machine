@@ -364,17 +364,17 @@ class MockDatabase
 
     private function applyWhere($rows, $whereClause, $params)
     {
-        $paramIndex = 0;
         $conditions = $this->parseWhereConditions($whereClause);
         
-        return array_filter($rows, function ($row) use ($conditions, &$paramIndex, $params) {
+        return array_values(array_filter($rows, function ($row) use ($conditions, $params) {
+            $paramIndex = 0;
             foreach ($conditions as $condition) {
                 if (!$this->evaluateCondition($row, $condition, $params, $paramIndex)) {
                     return false;
                 }
             }
             return true;
-        });
+        }));
     }
 
     private function parseWhereConditions($whereClause)

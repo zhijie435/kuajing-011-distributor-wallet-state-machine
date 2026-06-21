@@ -477,6 +477,11 @@ class WalletService
         ];
     }
 
+    public function fixWalletInconsistency(int $dealerId, string $operator = 'reconciliation'): array
+    {
+        return $this->reconciliationService->fixWalletInconsistency($dealerId, $operator);
+    }
+
     private function executeTransaction(callable $callback)
     {
         $this->pdo->beginTransaction();

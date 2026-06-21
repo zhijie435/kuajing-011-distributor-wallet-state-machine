@@ -52,17 +52,11 @@ class ReconciliationService
             $detail = $this->reconcileSingleFreezeRecord($record, $anomalies);
             $detailList[] = $detail;
 
-            $totalFreezeAmount += $record->amount;
-            $totalRemainingExpected += $record->remainingAmount;
+            $totalFreezeAmount = (float)bcadd((string)$totalFreezeAmount, (string)$record->amount, 2);
+            $totalRemainingExpected = (float)bcadd((string)$totalRemainingExpected, (string)$record->remainingAmount, 2);
 
-            foreach ($detail['transactions'] as $tx) {
-                if ($tx['type'] === TransactionType::UNFREEZE) {
-                    $totalUnfreezeAmount += $tx['amount'];
-                }
-                if ($tx['type'] === TransactionType::CONSUME && !empty($tx['related_no'])) {
-                    $totalDeductAmount += $tx['amount'];
-                }
-            }
+            $totalUnfreezeAmount = (float)bcadd((string)$totalUnfreezeAmount, (string)$detail['raw_sum_unfreeze'], 2);
+            $totalDeductAmount = (float)bcadd((string)$totalDeductAmount, (string)$detail['raw_sum_deduct'], 2);
         }
 
         $sumFrozenFromRecords = $this->freezeRecordRepository->sumFrozenByDealerId($dealerId);
@@ -160,7 +154,7 @@ class ReconciliationService
             }
 
             if ($tx->type === TransactionType::UNFREEZE) {
-                $sumUnfreeze += $tx->amount;
+                $sumUnfreeze = (float)bcadd((string)$sumUnfreeze, (string)$tx->amount, 2);
                 $expectedFrozenAfter = bcsub((string)$tx->frozenBefore, (string)$tx->amount, 2);
                 if (abs((float)$expectedFrozenAfter - $tx->frozenAfter) > 0.001) {
                     $anomalies[] = [
@@ -178,7 +172,7 @@ class ReconciliationService
             }
 
             if ($tx->type === TransactionType::CONSUME) {
-                $sumDeduct += $tx->amount;
+                $sumDeduct = (float)bcadd((string)$sumDeduct, (string)$tx->amount, 2);
                 $expectedBalanceAfter = bcsub((string)$tx->balanceBefore, (string)$tx->amount, 2);
                 if (abs((float)$expectedBalanceAfter - $tx->balanceAfter) > 0.001) {
                     $anomalies[] = [
@@ -267,6 +261,8 @@ class ReconciliationService
             'transactions' => $txArr,
             'sum_unfreeze' => number_format($sumUnfreeze, 2, '.', ''),
             'sum_deduct' => number_format($sumDeduct, 2, '.', ''),
+            'raw_sum_unfreeze' => $sumUnfreeze,
+            'raw_sum_deduct' => $sumDeduct,
             'expected_remaining' => number_format((float)$expectedRemaining, 2, '.', ''),
             'released_total' => number_format((float)$releasedAmount, 2, '.', ''),
         ];
@@ -864,6 +860,163 @@ class ReconciliationService
         }
 
         return $tips;
+    }
+
+    public function fixWalletInconsistency(int $dealerId, string $operator = 'reconciliation'): array
+    {
+        $wallet = $this->walletRepository->findByDealerId($dealerId);
+        if (!$wallet) {
+            return $this->buildResult(false, [], ['钱包不存在']);
+        }
+
+        $anomalies = [];
+        $fixes = [];
+        $needsFix = false;
+
+        $balanceResult = $this->reconcileBalanceChanges($dealerId);
+        $freezeResult = $this->reconcileFreezeRecords($dealerId);
+
+        $runningBalance = $balanceResult['data']['summary']['running_balance_final'] ?? null;
+        $runningFrozen = $balanceResult['data']['summary']['running_frozen_final'] ?? null;
+
+        $originalBalance = $wallet->balance;
+        $originalFrozen = $wallet->frozenAmount;
+        $originalAvailable = $wallet->availableAmount;
+        $originalStatus = $wallet->status;
+
+        if ($runningBalance !== null && abs((float)$runningBalance - $wallet->balance) > 0.001) {
+            $needsFix = true;
+            $wallet->balance = (float)$runningBalance;
+            $fixes[] = [
+                'field' => 'balance',
+                'old_value' => number_format($originalBalance, 2, '.', ''),
+                'new_value' => $runningBalance,
+                'reason' => '交易流水累计余额与钱包余额不一致，回写为流水累计值',
+            ];
+        }
+
+        if ($runningFrozen !== null && abs((float)$runningFrozen - $wallet->frozenAmount) > 0.001) {
+            $needsFix = true;
+            $wallet->frozenAmount = (float)$runningFrozen;
+            $fixes[] = [
+                'field' => 'frozen_amount',
+                'old_value' => number_format($originalFrozen, 2, '.', ''),
+                'new_value' => $runningFrozen,
+                'reason' => '交易流水累计冻结与钱包冻结不一致，回写为流水累计值',
+            ];
+        }
+
+        $wallet->calculateAvailable();
+
+        if (abs($wallet->availableAmount - $originalAvailable) > 0.001) {
+            $needsFix = true;
+            $fixes[] = [
+                'field' => 'available_amount',
+                'old_value' => number_format($originalAvailable, 2, '.', ''),
+                'new_value' => number_format($wallet->availableAmount, 2, '.', ''),
+                'reason' => '可用余额=余额-冻结金额 计算不一致，重新计算回写',
+            ];
+        }
+
+        if ($wallet->status !== $originalStatus) {
+            $needsFix = true;
+            $oldStatusName = \Dealer\Wallet\Enum\WalletStatus::getName($originalStatus);
+            $newStatusName = \Dealer\Wallet\Enum\WalletStatus::getName($wallet->status);
+            $fixes[] = [
+                'field' => 'status',
+                'old_value' => "{$originalStatus}({$oldStatusName})",
+                'new_value' => "{$wallet->status}({$newStatusName})",
+                'reason' => '根据余额和冻结金额重算状态，状态流转错位修复',
+            ];
+        }
+
+        $sumFrozenFromRecords = $this->freezeRecordRepository->sumFrozenByDealerId($dealerId);
+        if (abs($sumFrozenFromRecords - $wallet->frozenAmount) > 0.001 && !$needsFix) {
+            $anomalies[] = [
+                'severity' => self::SEVERITY_WARNING,
+                'code' => 'FREEZE_RECORD_SUM_MISMATCH',
+                'message' => sprintf(
+                    '冻结记录剩余汇总¥%.2f与钱包冻结金额¥%.2f不一致，但流水累计一致，可能存在冻结记录状态未更新',
+                    $sumFrozenFromRecords,
+                    $wallet->frozenAmount
+                ),
+            ];
+        }
+
+        if (!$needsFix) {
+            return $this->buildResult(true, $anomalies, [], [
+                'dealer_id' => $dealerId,
+                'fixed' => false,
+                'message' => '钱包状态与流水一致，无需修复',
+                'fixes' => [],
+            ]);
+        }
+
+        $this->pdo->beginTransaction();
+        try {
+            $updateSuccess = $this->forceUpdateWallet($wallet);
+            if (!$updateSuccess) {
+                throw new \Exception('钱包更新失败，可能存在并发修改，请重试');
+            }
+
+            $this->transactionRepository->create([
+                'wallet_id' => $wallet->id,
+                'dealer_id' => $wallet->dealerId,
+                'type' => TransactionType::RECHARGE,
+                'amount' => 0.00,
+                'balance_before' => $originalBalance,
+                'balance_after' => $wallet->balance,
+                'frozen_before' => $originalFrozen,
+                'frozen_after' => $wallet->frozenAmount,
+                'related_no' => 'RECONCILIATION_FIX_' . date('YmdHis'),
+                'operator' => $operator,
+                'remark' => '核对修复：' . implode('；', array_column($fixes, 'reason')),
+            ]);
+
+            $this->pdo->commit();
+        } catch (\Exception $e) {
+            $this->pdo->rollBack();
+            return $this->buildResult(false, [], ['修复失败：' . $e->getMessage()]);
+        }
+
+        $freshWallet = $this->walletRepository->findByDealerId($dealerId);
+
+        return $this->buildResult(true, $anomalies, [], [
+            'dealer_id' => $dealerId,
+            'fixed' => true,
+            'message' => '钱包状态已根据交易流水回写修复',
+            'fixes' => $fixes,
+            'original_values' => [
+                'balance' => number_format($originalBalance, 2, '.', ''),
+                'frozen_amount' => number_format($originalFrozen, 2, '.', ''),
+                'available_amount' => number_format($originalAvailable, 2, '.', ''),
+                'status' => "{$originalStatus}(" . \Dealer\Wallet\Enum\WalletStatus::getName($originalStatus) . ")",
+            ],
+            'wallet_after_fix' => $freshWallet ? $freshWallet->toArray() : null,
+        ]);
+    }
+
+    private function forceUpdateWallet(Wallet $wallet): bool
+    {
+        $sql = "UPDATE dealer_wallet 
+                SET balance = :balance, 
+                    frozen_amount = :frozen_amount, 
+                    available_amount = :available_amount,
+                    status = :status,
+                    updated_at = :updated_at
+                WHERE id = :id";
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->bindValue(':balance', $wallet->balance);
+        $stmt->bindValue(':frozen_amount', $wallet->frozenAmount);
+        $stmt->bindValue(':available_amount', $wallet->availableAmount);
+        $stmt->bindValue(':status', $wallet->status, PDO::PARAM_INT);
+        $stmt->bindValue(':updated_at', date('Y-m-d H:i:s'));
+        $stmt->bindValue(':id', $wallet->id, PDO::PARAM_INT);
+        $result = $stmt->execute();
+        if ($result && $stmt->rowCount() > 0) {
+            $wallet->version++;
+        }
+        return $result;
     }
 
     private function buildResult(bool $success, array $anomalies = [], array $errors = [], array $data = []): array
