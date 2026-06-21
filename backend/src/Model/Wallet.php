@@ -17,20 +17,54 @@ class Wallet
     public string $createdAt;
     public string $updatedAt;
 
-    public function __construct(array $data = [])
+    public function __construct(array $data = [], bool $fromDatabase = true)
     {
         foreach ($data as $key => $value) {
             $property = lcfirst(str_replace('_', '', ucwords($key, '_')));
             if (property_exists($this, $property)) {
-                $this->$property = $value;
+                $this->$property = $this->castProperty($property, $value);
             }
         }
-        $this->calculateAvailable();
+        if (!$fromDatabase) {
+            $this->calculateAvailable();
+        } else {
+            $this->sanitizeFromDatabase();
+        }
+    }
+
+    private function castProperty(string $property, $value)
+    {
+        $intProps = ['id', 'dealerId', 'status', 'version'];
+        $floatProps = ['balance', 'frozenAmount', 'availableAmount'];
+        if (in_array($property, $intProps, true)) {
+            return (int)$value;
+        }
+        if (in_array($property, $floatProps, true)) {
+            return (float)$value;
+        }
+        return (string)$value;
+    }
+
+    private function sanitizeFromDatabase(): void
+    {
+        $expectedAvailable = (float)bcsub((string)($this->balance ?? 0), (string)($this->frozenAmount ?? 0), 2);
+        $expectedStatus = WalletStateMachine::calculateStatus((float)($this->balance ?? 0), (float)($this->frozenAmount ?? 0));
+
+        $dbAvailable = $this->availableAmount ?? 0.0;
+        $dbStatus = $this->status ?? WalletStatus::NORMAL;
+
+        $availDiff = abs($expectedAvailable - (float)$dbAvailable) > 0.001;
+        $statusDiff = $expectedStatus !== $dbStatus;
+
+        if ($availDiff || $statusDiff) {
+            $this->availableAmount = $expectedAvailable;
+            $this->status = $expectedStatus;
+        }
     }
 
     public function calculateAvailable(): void
     {
-        $this->availableAmount = bcsub($this->balance, $this->frozenAmount, 2);
+        $this->availableAmount = (float)bcsub((string)$this->balance, (string)$this->frozenAmount, 2);
         $this->status = WalletStateMachine::calculateStatus($this->balance, $this->frozenAmount);
     }
 
@@ -46,8 +80,8 @@ class Wallet
             'status_name' => WalletStatus::getName($this->status),
             'status_color' => WalletStatus::getColor($this->status),
             'version' => $this->version,
-            'created_at' => $this->createdAt,
-            'updated_at' => $this->updatedAt,
+            'created_at' => $this->createdAt ?? '',
+            'updated_at' => $this->updatedAt ?? '',
         ];
     }
 }

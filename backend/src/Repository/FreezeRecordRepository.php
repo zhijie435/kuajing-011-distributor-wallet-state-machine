@@ -87,4 +87,74 @@ class FreezeRecordRepository
     {
         return 'FZ' . date('YmdHis') . str_pad(random_int(0, 9999), 4, '0', STR_PAD_LEFT);
     }
+
+    public function findAllByWalletId(int $walletId): array
+    {
+        $sql = "SELECT * FROM dealer_wallet_freeze_record WHERE wallet_id = :wallet_id ORDER BY id ASC";
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->bindValue(':wallet_id', $walletId, PDO::PARAM_INT);
+        $stmt->execute();
+        $items = [];
+        while ($data = $stmt->fetch()) {
+            $items[] = new FreezeRecord($data);
+        }
+        return $items;
+    }
+
+    public function findAllByDealerId(int $dealerId): array
+    {
+        $sql = "SELECT * FROM dealer_wallet_freeze_record WHERE dealer_id = :dealer_id ORDER BY id ASC";
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->bindValue(':dealer_id', $dealerId, PDO::PARAM_INT);
+        $stmt->execute();
+        $items = [];
+        while ($data = $stmt->fetch()) {
+            $items[] = new FreezeRecord($data);
+        }
+        return $items;
+    }
+
+    public function findByDateRange(?string $startDate = null, ?string $endDate = null, ?int $dealerId = null): array
+    {
+        $sql = "SELECT * FROM dealer_wallet_freeze_record WHERE 1=1";
+        $params = [];
+        if ($startDate) {
+            $sql .= " AND created_at >= :start_date";
+            $params[':start_date'] = $startDate;
+        }
+        if ($endDate) {
+            $sql .= " AND created_at <= :end_date";
+            $params[':end_date'] = $endDate;
+        }
+        if ($dealerId !== null) {
+            $sql .= " AND dealer_id = :dealer_id";
+            $params[':dealer_id'] = $dealerId;
+        }
+        $sql .= " ORDER BY id ASC";
+        $stmt = $this->pdo->prepare($sql);
+        foreach ($params as $key => $value) {
+            if ($key === ':dealer_id') {
+                $stmt->bindValue($key, $value, PDO::PARAM_INT);
+            } else {
+                $stmt->bindValue($key, $value);
+            }
+        }
+        $stmt->execute();
+        $items = [];
+        while ($data = $stmt->fetch()) {
+            $items[] = (new FreezeRecord($data))->toArray();
+        }
+        return $items;
+    }
+
+    public function sumFrozenByDealerId(int $dealerId): float
+    {
+        $sql = "SELECT COALESCE(SUM(remaining_amount), 0) FROM dealer_wallet_freeze_record 
+                WHERE dealer_id = :dealer_id AND status = :status";
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->bindValue(':dealer_id', $dealerId, PDO::PARAM_INT);
+        $stmt->bindValue(':status', FreezeStatus::FROZEN, PDO::PARAM_INT);
+        $stmt->execute();
+        return (float)$stmt->fetchColumn();
+    }
 }

@@ -188,10 +188,10 @@ class MockDatabase
         $rows = $this->tables[$table];
         
         $joinMatches = [];
-        if (preg_match_all('/(INNER|LEFT|RIGHT)?\s*JOIN\s+(\w+)\s+ON\s+([^\s]+(?:\s*=\s*[^\s]+)*)/i', $sql, $joinMatches, PREG_SET_ORDER)) {
+        if (preg_match_all('/(INNER|LEFT|RIGHT)?\s*JOIN\s+(\w+)\s+ON\s+(.+?)(?:\s+(?:WHERE|GROUP|ORDER|LIMIT|$))/is', $sql, $joinMatches, PREG_SET_ORDER)) {
             foreach ($joinMatches as $joinMatch) {
                 $joinTable = $joinMatch[2];
-                $onCondition = $joinMatch[3];
+                $onCondition = trim($joinMatch[3]);
                 $joinType = strtoupper($joinMatch[1] ?? 'INNER');
                 
                 if (isset($this->tables[$joinTable])) {
@@ -201,9 +201,28 @@ class MockDatabase
         }
         
         $whereMatches = [];
-        if (preg_match('/WHERE\s+(.+?)(?:ORDER|LIMIT|$)/is', $sql, $whereMatches)) {
+        if (preg_match('/WHERE\s+(.+?)(?:GROUP|ORDER|LIMIT|$)/is', $sql, $whereMatches)) {
             $whereClause = trim($whereMatches[1]);
             $rows = $this->applyWhere($rows, $whereClause, $params);
+        }
+        
+        $groupByMatches = [];
+        $isGrouped = false;
+        $groupByColumns = [];
+        if (preg_match('/GROUP\s+BY\s+(.+?)(?:ORDER|LIMIT|HAVING|$)/is', $sql, $groupByMatches)) {
+            $groupByClause = trim($groupByMatches[1]);
+            $groupByColumns = array_map('trim', explode(',', $groupByClause));
+            $groupByColumns = array_map(function ($col) {
+                if (strpos($col, '.') !== false) {
+                    return explode('.', $col)[1];
+                }
+                return $col;
+            }, $groupByColumns);
+            $isGrouped = true;
+        }
+        
+        if ($isGrouped && !empty($groupByColumns)) {
+            $rows = $this->applyGroupBy($rows, $groupByColumns);
         }
         
         $orderMatches = [];
@@ -223,11 +242,75 @@ class MockDatabase
         if (preg_match('/SELECT\s+(.+?)\s+FROM/i', $sql, $selectMatches)) {
             $selectClause = trim($selectMatches[1]);
             if ($selectClause !== '*') {
-                $rows = $this->applySelectColumns($rows, $selectClause);
+                $rows = $this->applySelectColumns($rows, $selectClause, $isGrouped);
             }
         }
         
         return $rows;
+    }
+
+    private function applyGroupBy($rows, $groupByColumns)
+    {
+        $groups = [];
+        
+        foreach ($rows as $row) {
+            $keyParts = [];
+            foreach ($groupByColumns as $col) {
+                $keyParts[] = $row[$col] ?? '';
+            }
+            $key = implode('|', $keyParts);
+            
+            if (!isset($groups[$key])) {
+                $groups[$key] = [
+                    'group_key' => $key,
+                    'rows' => [],
+                ];
+                foreach ($groupByColumns as $col) {
+                    $groups[$key][$col] = $row[$col] ?? null;
+                }
+            }
+            $groups[$key]['rows'][] = $row;
+        }
+        
+        $result = [];
+        foreach ($groups as $group) {
+            $groupRows = $group['rows'];
+            $aggregatedRow = [];
+            
+            foreach ($groupByColumns as $col) {
+                $aggregatedRow[$col] = $group[$col];
+            }
+            
+            $allColumns = [];
+            foreach ($groupRows as $row) {
+                foreach ($row as $col => $val) {
+                    if (!in_array($col, $groupByColumns) && !isset($aggregatedRow[$col])) {
+                        $aggregatedRow[$col] = $this->aggregateColumn($groupRows, $col);
+                    }
+                }
+            }
+            
+            $aggregatedRow['_group_rows'] = $groupRows;
+            $result[] = $aggregatedRow;
+        }
+        
+        return $result;
+    }
+
+    private function aggregateColumn($groupRows, $column)
+    {
+        $values = [];
+        foreach ($groupRows as $row) {
+            if (isset($row[$column]) && $row[$column] !== null) {
+                $values[] = $row[$column];
+            }
+        }
+        
+        if (empty($values)) {
+            return null;
+        }
+        
+        return $values[0];
     }
 
     private function joinTables($leftRows, $rightRows, $onCondition, $joinType)
@@ -238,20 +321,33 @@ class MockDatabase
             return $leftRows;
         }
         
-        $leftCol = trim($parts[0]);
-        $rightCol = trim($parts[1]);
+        $col1 = trim($parts[0]);
+        $col2 = trim($parts[1]);
         
-        if (strpos($leftCol, '.') !== false) {
-            $leftCol = explode('.', $leftCol)[1];
+        $col1Name = $col1;
+        if (strpos($col1Name, '.') !== false) {
+            $col1Name = explode('.', $col1Name)[1];
         }
-        if (strpos($rightCol, '.') !== false) {
-            $rightCol = explode('.', $rightCol)[1];
+        $col2Name = $col2;
+        if (strpos($col2Name, '.') !== false) {
+            $col2Name = explode('.', $col2Name)[1];
+        }
+        
+        $leftCol = $col1Name;
+        $rightCol = $col2Name;
+        
+        if (!empty($leftRows) && !isset($leftRows[0][$leftCol]) && isset($leftRows[0][$rightCol])) {
+            $leftCol = $col2Name;
+            $rightCol = $col1Name;
         }
         
         foreach ($leftRows as $leftRow) {
             $found = false;
             foreach ($rightRows as $rightRow) {
-                if (($leftRow[$leftCol] ?? null) == ($rightRow[$rightCol] ?? null)) {
+                $leftVal = $leftRow[$leftCol] ?? null;
+                $rightVal = $rightRow[$rightCol] ?? null;
+                
+                if ($leftVal !== null && $rightVal !== null && $leftVal == $rightVal) {
                     $result[] = array_merge($leftRow, $rightRow);
                     $found = true;
                 }
@@ -407,67 +503,188 @@ class MockDatabase
         return $rows;
     }
 
-    private function applySelectColumns($rows, $selectClause)
+    private function applySelectColumns($rows, $selectClause, $isGrouped = false)
     {
-        $columns = array_map('trim', explode(',', $selectClause));
-        $selectedCols = [];
-        
-        foreach ($columns as $col) {
-            if (strpos($col, '.') !== false) {
-                $col = explode('.', $col)[1];
-            }
-            $col = trim($col);
-            
-            if (preg_match('/^(.+?)\s+AS\s+(.+)$/i', $col, $matches)) {
-                $selectedCols[] = [
-                    'expr' => trim($matches[1]),
-                    'alias' => trim($matches[2]),
-                ];
-            } else {
-                $selectedCols[] = [
-                    'expr' => $col,
-                    'alias' => $col,
-                ];
-            }
-        }
+        $columns = $this->parseSelectColumns($selectClause);
         
         $result = [];
         foreach ($rows as $row) {
             $newRow = [];
-            foreach ($selectedCols as $col) {
+            foreach ($columns as $col) {
                 $expr = $col['expr'];
                 $alias = $col['alias'];
                 
-                if (strtolower($expr) === 'count(*)' || strtolower($expr) === 'count(1)') {
-                    $newRow[$alias] = count($rows);
-                } elseif (strpos($expr, 'COALESCE') === 0 || strpos($expr, 'coalesce') === 0) {
-                    if (preg_match('/coalesce\s*\((.+?)\s*,\s*(.+)\)/i', $expr, $matches)) {
-                        $colName = trim($matches[1]);
-                        if (strpos($colName, '.') !== false) {
-                            $colName = explode('.', $colName)[1];
-                        }
-                        $defaultVal = trim($matches[2]);
-                        if (is_numeric($defaultVal)) {
-                            $defaultVal = $defaultVal + 0;
-                        }
-                        $newRow[$alias] = $row[$colName] ?? $defaultVal;
-                    }
-                } elseif (strtolower($expr) === 'sum(wi.quantity)') {
-                    $newRow[$alias] = $row['quantity'] ?? 0;
-                } elseif (strtolower($expr) === 'sum(wi.available_quantity)') {
-                    $newRow[$alias] = $row['available_quantity'] ?? 0;
-                } else {
-                    $colName = $expr;
-                    if (strpos($colName, '(') !== false) {
-                        continue;
-                    }
-                    if (strpos($colName, '.') !== false) {
-                        $colName = explode('.', $colName)[1];
-                    }
-                    $newRow[$alias] = $row[$colName] ?? null;
-                }
+                $value = $this->evaluateExpression($expr, $row, $isGrouped);
+                $newRow[$alias] = $value;
             }
             $result[] = $newRow;
+        }
+        
+        return $result;
+    }
+
+    private function parseSelectColumns($selectClause)
+    {
+        $columns = [];
+        $parts = $this->splitSelectColumns($selectClause);
+        
+        foreach ($parts as $col) {
+            $col = trim($col);
+            
+            if (preg_match('/^(.+?)\s+AS\s+(.+)$/i', $col, $matches)) {
+                $columns[] = [
+                    'expr' => trim($matches[1]),
+                    'alias' => trim($matches[2]),
+                ];
+            } else {
+                $alias = $col;
+                if (strpos($alias, '.') !== false) {
+                    $alias = explode('.', $alias)[1];
+                }
+                $columns[] = [
+                    'expr' => $col,
+                    'alias' => $alias,
+                ];
+            }
+        }
+        
+        return $columns;
+    }
+
+    private function splitSelectColumns($selectClause)
+    {
+        $result = [];
+        $current = '';
+        $parenDepth = 0;
+        
+        for ($i = 0; $i < strlen($selectClause); $i++) {
+            $char = $selectClause[$i];
+            
+            if ($char === '(') {
+                $parenDepth++;
+                $current .= $char;
+            } elseif ($char === ')') {
+                $parenDepth--;
+                $current .= $char;
+            } elseif ($char === ',' && $parenDepth === 0) {
+                $result[] = trim($current);
+                $current = '';
+            } else {
+                $current .= $char;
+            }
+        }
+        
+        if (trim($current) !== '') {
+            $result[] = trim($current);
+        }
+        
+        return $result;
+    }
+
+    private function evaluateExpression($expr, $row, $isGrouped = false)
+    {
+        $expr = trim($expr);
+        $lowerExpr = strtolower($expr);
+        
+        if ($lowerExpr === 'count(*)' || $lowerExpr === 'count(1)') {
+            if ($isGrouped && isset($row['_group_rows'])) {
+                return count($row['_group_rows']);
+            }
+            return 1;
+        }
+        
+        if (preg_match('/^count\s*\((.+)\)$/i', $expr, $matches)) {
+            $colName = trim($matches[1]);
+            if (strpos($colName, '.') !== false) {
+                $colName = explode('.', $colName)[1];
+            }
+            if ($isGrouped && isset($row['_group_rows'])) {
+                $count = 0;
+                foreach ($row['_group_rows'] as $r) {
+                    if (isset($r[$colName]) && $r[$colName] !== null) {
+                        $count++;
+                    }
+                }
+                return $count;
+            }
+            return isset($row[$colName]) && $row[$colName] !== null ? 1 : 0;
+        }
+        
+        if (preg_match('/^sum\s*\((.+)\)$/i', $expr, $matches)) {
+            $colName = trim($matches[1]);
+            if (strpos($colName, '.') !== false) {
+                $colName = explode('.', $colName)[1];
+            }
+            if ($isGrouped && isset($row['_group_rows'])) {
+                $sum = 0;
+                foreach ($row['_group_rows'] as $r) {
+                    if (isset($r[$colName]) && is_numeric($r[$colName])) {
+                        $sum += $r[$colName];
+                    }
+                }
+                return $sum;
+            }
+            return $row[$colName] ?? 0;
+        }
+        
+        if (preg_match('/^coalesce\s*\((.+)\)$/i', $expr, $matches)) {
+            $args = $this->splitFunctionArgs($matches[1]);
+            foreach ($args as $arg) {
+                $arg = trim($arg);
+                if (is_numeric($arg)) {
+                    return $arg + 0;
+                }
+                if (preg_match("/^'(.+)'$/", $arg, $strMatches)) {
+                    return $strMatches[1];
+                }
+                $colName = $arg;
+                if (strpos($colName, '.') !== false) {
+                    $colName = explode('.', $colName)[1];
+                }
+                if (isset($row[$colName]) && $row[$colName] !== null) {
+                    return $row[$colName];
+                }
+            }
+            return null;
+        }
+        
+        $colName = $expr;
+        if (strpos($colName, '.') !== false) {
+            $colName = explode('.', $colName)[1];
+        }
+        
+        if (strpos($colName, '(') !== false) {
+            return null;
+        }
+        
+        return $row[$colName] ?? null;
+    }
+
+    private function splitFunctionArgs($argsStr)
+    {
+        $result = [];
+        $current = '';
+        $parenDepth = 0;
+        
+        for ($i = 0; $i < strlen($argsStr); $i++) {
+            $char = $argsStr[$i];
+            
+            if ($char === '(') {
+                $parenDepth++;
+                $current .= $char;
+            } elseif ($char === ')') {
+                $parenDepth--;
+                $current .= $char;
+            } elseif ($char === ',' && $parenDepth === 0) {
+                $result[] = trim($current);
+                $current = '';
+            } else {
+                $current .= $char;
+            }
+        }
+        
+        if (trim($current) !== '') {
+            $result[] = trim($current);
         }
         
         return $result;
